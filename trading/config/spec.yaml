@@ -3,9 +3,10 @@ horizon: swing
 direction: long_only
 universe: nasdaq100
 benchmark: QQQ
-rebalance: weekly
-rebalance_day: monday
-rebalance_timing: open
+# Rebalance cadence: daily = every trading session; weekly = once per ISO week
+rebalance: daily
+# rebalance_day: monday  # weekly only — first session of that weekday in each week
+rebalance_timing: open  # signals applied at session open (paper/backtest)
 
 max_positions: 12
 risk_per_trade_pct: 1.0
