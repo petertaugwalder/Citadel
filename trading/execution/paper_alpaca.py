@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Weekly paper rebalance via Alpaca. Falls back to dry-run audit log without API keys.
+Daily paper rebalance via Alpaca (latest signal date). Dry-run audit log without API keys.
 
 Env:
   ALPACA_API_KEY, ALPACA_SECRET_KEY

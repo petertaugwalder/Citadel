@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Walk-forward weekly backtest with costs vs benchmark."""
+"""Walk-forward backtest with daily or weekly rebalance and costs vs benchmark."""
 
 from __future__ import annotations
 
@@ -32,14 +32,34 @@ def load_prices_wide(symbols: list[str]) -> pd.DataFrame:
     return out
 
 
-def weekly_rebalance_dates(dates: list[date]) -> list[date]:
-    """Mondays (or first trading day of week) from sorted date list."""
-    s = pd.Series(dates)
+def _weekly_rebalance_dates(dates: list[date], rebalance_day: str = "monday") -> list[date]:
+    """First trading session of each ISO week (Monday by default, or earliest day >= rebalance_day)."""
+    day_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4}
+    target_dow = day_map.get(rebalance_day.lower(), 0)
+    s = pd.Series(sorted(set(dates)))
     df = pd.DataFrame({"date": pd.to_datetime(s)})
     df["week"] = df["date"].dt.isocalendar().week.astype(int)
     df["year"] = df["date"].dt.isocalendar().year.astype(int)
-    first = df.groupby(["year", "week"])["date"].min()
-    return [d.date() for d in first]
+    df["dow"] = df["date"].dt.dayofweek
+    if target_dow == 0:
+        first = df.groupby(["year", "week"])["date"].min()
+        return [d.date() for d in first]
+    picks = []
+    for (_, _), grp in df.groupby(["year", "week"]):
+        eligible = grp[grp["dow"] >= target_dow]
+        pick = eligible["date"].min() if not eligible.empty else grp["date"].min()
+        picks.append(pick.date())
+    return picks
+
+
+def rebalance_dates(dates: list[date], spec: dict) -> list[date]:
+    """Trading dates on which portfolio is rebalanced, per spec.rebalance."""
+    cadence = str(spec.get("rebalance", "daily")).lower()
+    if cadence == "daily":
+        return sorted(set(dates))
+    if cadence == "weekly":
+        return _weekly_rebalance_dates(dates, str(spec.get("rebalance_day", "monday")))
+    raise ValueError(f"Unsupported rebalance cadence: {cadence!r} (use daily or weekly)")
 
 
 def run_backtest(
@@ -54,7 +74,7 @@ def run_backtest(
     cost_rate = cost_bps / 10_000.0
 
     dates = sorted(ranked["date"].unique())
-    rebalance_dates = set(weekly_rebalance_dates(dates))
+    rebalance_set = set(rebalance_dates(dates, spec))
 
     holdings: dict[str, dict] = {}
     equity = 1.0
@@ -70,7 +90,7 @@ def run_backtest(
             continue
         row = prices.loc[d]
 
-        if d in rebalance_dates:
+        if d in rebalance_set:
             day_rank = ranked[ranked["date"] == d]
             targets = day_rank[day_rank["enter"]].sort_values("score", ascending=False).head(max_pos)
             target_syms = set(targets["symbol"].tolist())
