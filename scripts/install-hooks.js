@@ -29,6 +29,7 @@ function parseArgs(argv) {
     hookProfile: process.env.CITADEL_CLAUDE_HOOK_PROFILE || 'auto',
     claudeVersion: process.env.CITADEL_CLAUDE_VERSION || null,
   };
+  let projectRootExplicit = false;
 
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
@@ -53,8 +54,9 @@ function parseArgs(argv) {
       continue;
     }
 
-    if (!arg.startsWith('--') && options.projectRoot === (process.env.CLAUDE_PROJECT_DIR || process.cwd())) {
+    if (!arg.startsWith('--') && !projectRootExplicit) {
       options.projectRoot = arg;
+      projectRootExplicit = true;
     }
   }
 
