@@ -1,0 +1,10 @@
+{
+  "cagr": 0.3481,
+  "benchmark_cagr": 0.2606,
+  "excess_cagr": 0.0875,
+  "sharpe": 1.755,
+  "max_drawdown": -0.0796,
+  "trades": 178,
+  "final_equity": 1.8136,
+  "curve_rows": 500
+}

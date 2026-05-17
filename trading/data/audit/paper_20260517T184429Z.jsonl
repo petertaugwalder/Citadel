@@ -1,0 +1,1 @@
+{"as_of_date": "2026-05-15", "equity": 100000.0, "targets": ["AAPL"], "orders": [{"symbol": "AAPL", "side": "buy", "notional_usd": 98000.0, "dry_run": true, "timestamp": "2026-05-17T18:44:29.791276+00:00"}], "dry_run": true}
