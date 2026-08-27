@@ -20,6 +20,7 @@ Usage:
   python schwab_client.py doctor    # diagnose: creds -> network -> tokens -> data
   python schwab_client.py login     # one-time browser auth (auto-captures the redirect)
   python schwab_client.py login --manual   # fallback: paste the redirected URL yourself
+  python schwab_client.py login --code '<redirected URL or bare code>'   # non-interactive
   python schwab_client.py status    # token age / expiry
   python schwab_client.py quote SCHD
   python schwab_client.py chain SCHD --min-dte 150 --target-delta 0.70
@@ -219,7 +220,7 @@ def _capture_code(redirect_uri: str, timeout: int = 300) -> str | None:
     return box.get("code")
 
 
-def login(manual: bool = False) -> None:
+def login(manual: bool = False, supplied: str | None = None) -> None:
     """Browser auth. Default: a loopback HTTPS listener captures the redirect
     automatically (no copy-paste, no 30-second race). --manual falls back to pasting."""
     cred = load_credentials()
@@ -237,7 +238,16 @@ def login(manual: bool = False) -> None:
     print("   ⚠ THE CODE EXPIRES IN ~30 SECONDS. Have this terminal ready and paste fast;")
     print("     if it fails, just run login again — a stale code is the usual cause.\n")
     code = None
-    if not manual and _ensure_cert():
+    if supplied:  # non-interactive: user pasted the URL (or bare code) as an argument
+        supplied = supplied.strip().strip('"\'')
+        if "code=" in supplied:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(supplied).query)
+            code = (qs.get("code") or [None])[0]
+        else:
+            code = supplied
+        if not code:
+            raise SchwabError("could not find a code in what you passed to --code")
+    if code is None and not manual and _ensure_cert():
         print("   Starting a local HTTPS listener to capture the redirect automatically.")
         print("   Your browser will warn about a self-signed certificate for 127.0.0.1 —")
         print("   click Advanced → Proceed. That page is served by this script, not the internet.\n")
@@ -253,6 +263,9 @@ def login(manual: bool = False) -> None:
         print("   openssl not found, so the automatic listener is unavailable.\n")
 
     if not code:
+        print("   If the browser shows \"this site can't be reached\" / \"website is not working\",")
+        print("   that is EXPECTED — copy the whole address bar from that page and paste it here.")
+        print("   (Or press Ctrl-C and re-run:  python schwab_client.py login --code '<paste>')\n")
         pasted = input("redirected URL (or just the code): ").strip().strip('"\'')
         if not pasted:
             raise SchwabError("nothing pasted — run login on its own line, not chained with other commands")
@@ -473,7 +486,8 @@ def main() -> int:
     cmd = args[0] if args else "status"
     try:
         if cmd == "login":
-            login(manual="--manual" in args)
+            supplied = args[args.index("--code") + 1] if "--code" in args else None
+            login(manual="--manual" in args or bool(supplied), supplied=supplied)
         elif cmd == "status":
             status()
         elif cmd == "doctor":
