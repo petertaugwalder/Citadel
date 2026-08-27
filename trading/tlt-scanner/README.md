@@ -35,12 +35,38 @@ python tlt_scanner.py --explain   # the trading logic, in the terminal
 | `python tlt_scanner.py --allocate` | Adds the experimental allocator panel (gate + current position); with `--backtest`, runs the allocator variant |
 | `python tlt_scanner.py --ablate --from 2020-01-01` | 4-variant ablation (current / no-SCOUT / no-trail / allocator) at 1bp and 5bp; `--from` sets the window start |
 | `python tlt_scanner.py --watch 900 --notify` | Re-scan every 15 min, macOS notification on a new BUY |
+| `python tlt_scanner.py --only scanner` | Render just the price tape panel — nothing else |
+| `python tlt_scanner.py --only scanner,plan --watch 900` | Pick the panels you want; comma-separated |
 | `python tlt_scanner.py --account 50000 --risk 1.0` | Adds position sizing (risk 1% of $50k per trade) |
 | `python tlt_scanner.py --entry 82.50` | Adds open P&L and R-multiple to the exit engine, plus a stop-to-breakeven suggestion past +1R |
 | `python tlt_scanner.py --json` | Machine-readable output for piping |
 | `python tlt_scanner.py --alert-exit` | Exit code 2 on a BUY, 3 on an EXIT — for scripting/cron |
 | `python tlt_scanner.py --demo` | Synthetic data (no network) to see the output shape |
 | `--refresh` / `--plain` | Force re-download / force plain ANSI output |
+
+### Picking panels with `--only`
+
+The full dashboard is ~60 lines. In `--watch` mode that is taller than most
+terminal windows, so each refresh scrolls the previous frame into scrollback
+instead of repainting in place — the screen fills with repeated stacks. Narrow
+the output and it repaints cleanly:
+
+```
+python tlt_scanner.py --only scanner --watch 900
+```
+
+Panel names: `scanner` (the price tape — 11 lines), `signals` (regime + trend-turn
+stack + bounce), `checks` (divergences and macro cross-checks), `plan`, `exit`
+(exit engine), `schd`, `allocator`. `tape` and `duration` are accepted as aliases
+for `scanner`. An unknown name is rejected with the valid list. `--only` shapes
+the dashboard in both rich and `--plain` mode; `--json` always emits the full
+payload.
+
+Note that `--watch` forces a fresh download every cycle (the 4h cache would serve
+stale bars) and the loop sleeps at least 30s regardless of the value passed. Very
+short intervals — especially alongside another scanner polling the same source —
+will get you rate-limited upstream; 900 (15 min) is a sane default for a tape you
+are watching all session.
 
 Cache lives in `~/.cache/tlt-scanner/` (4h TTL), so repeated runs are instant.
 

@@ -1042,16 +1042,41 @@ def paint(cond: bool | None, txt_true="YES", txt_false="no", txt_na="n/a") -> st
     return f"{GREEN}{txt_true}{END}" if cond else f"{RED}{txt_false}{END}"
 
 
-def render_plain(res: dict, demo: bool) -> None:
+PANELS = ("scanner", "signals", "checks", "plan", "exit", "schd", "allocator")
+PANEL_HELP = "scanner=the price tape, signals=regime+stack, checks=divergences/macro, " \
+             "plan, exit=exit engine, schd, allocator"
+
+
+def parse_only(spec: str | None) -> set[str]:
+    """--only scanner,plan -> {"scanner", "plan"}. Bare None means every panel."""
+    if not spec:
+        return set(PANELS)
+    names = {n.strip().lower() for n in spec.split(",") if n.strip()}
+    aliases = {"tape": "scanner", "duration": "scanner", "signal": "signals",
+               "cross-checks": "checks", "cross": "checks", "exits": "exit"}
+    names = {aliases.get(n, n) for n in names}
+    unknown = names - set(PANELS)
+    if unknown:
+        raise SystemExit(
+            f"--only: unknown panel {', '.join(sorted(unknown))}. "
+            f"Choose from: {', '.join(PANELS)}"
+        )
+    return names
+
+
+def render_plain(res: dict, demo: bool, only: set[str] | None = None) -> None:
+    only = only if only is not None else set(PANELS)
     src = " (DEMO DATA — synthetic)" if demo else ""
     reg = res["regime"]
     color = GREEN if reg["label"] == "BULLISH" else RED if reg["label"] == "BEARISH" else YEL
     print(f"\n{BOLD}TLT DURATION SCANNER{END}  as of {res['as_of']}{src}")
     print("=" * 74)
-    print(f"\n{BOLD}TAPE{END}")
+    if "scanner" in only:
+        print(f"\n{BOLD}TAPE{END}")
     hdr = f"  {'':5} {'last':>9} {'chg%':>7} {'RSI':>6} {'50d':>9} {'200d':>9} {'MACD':>6} {'20d%':>7}"
-    print(DIM + hdr + END)
-    for name, t in res["tape"].items():
+    if "scanner" in only:
+        print(DIM + hdr + END)
+    for name, t in (res["tape"].items() if "scanner" in only else ()):
         last = to_32nds(t["close"]) if name == "UB" else f"{t['close']:.2f}"
         s50 = to_32nds(t["sma50"]) if name == "UB" and t["sma50"] else (f"{t['sma50']:.2f}" if t["sma50"] else "—")
         s200 = to_32nds(t["sma200"]) if name == "UB" and t["sma200"] else (f"{t['sma200']:.2f}" if t["sma200"] else "—")
@@ -1059,64 +1084,73 @@ def render_plain(res: dict, demo: bool) -> None:
         chg = (GREEN if t["chg1"] >= 0 else RED) + f"{chg:>7}" + END
         macd_s = paint(t["macd_up"], "up", "down")
         print(f"  {name:5} {last:>9} {chg} {t['rsi14']:>6} {s50:>9} {s200:>9} {macd_s:>15} {t['roc20']:>+7.1f}")
-    print(f"\n{BOLD}REGIME{END}  {color}{reg['label']}{END}  score {reg['score']:+.0f} / ±100")
+    if "signals" in only:
+        print(f"\n{BOLD}REGIME{END}  {color}{reg['label']}{END}  score {reg['score']:+.0f} / ±100")
     neg = [c["name"] for c in reg["components"] if c["bullish"] is False]
     pos = [c["name"] for c in reg["components"] if c["bullish"]]
-    if pos:
+    if pos and "signals" in only:
         print(f"  {GREEN}+{END} " + ", ".join(pos))
-    if neg:
+    if neg and "signals" in only:
         print(f"  {RED}−{END} " + ", ".join(neg))
     st = res["stack"]
-    print(f"\n{BOLD}TREND-TURN STACK{END}  {st['lit']}/{st['of']} lit → tier: {st['tier']}")
-    for i in st["items"]:
-        print(f"  [{paint(i['on'], 'x', ' ', '?')}] {i['name']}")
+    if "signals" in only:
+        print(f"\n{BOLD}TREND-TURN STACK{END}  {st['lit']}/{st['of']} lit → tier: {st['tier']}")
+        for i in st["items"]:
+            print(f"  [{paint(i['on'], 'x', ' ', '?')}] {i['name']}")
     b = res["bounce"]
     b_txt = "TRIGGERED TODAY" if b["triggered_today"] else ("active — managing" if b["active"] else "idle")
     b_col = GREEN if b["active"] else DIM
     since = f" (last trigger {b['last_trigger']}, {b['days_since']}d ago)" if b["last_trigger"] else ""
-    print(f"\n{BOLD}BOUNCE SIGNAL{END}  {b_col}{b_txt}{END}{since}")
-    if res["divergences"]:
+    if "signals" in only:
+        print(f"\n{BOLD}BOUNCE SIGNAL{END}  {b_col}{b_txt}{END}{since}")
+    if res["divergences"] and "checks" in only:
         print(f"\n{BOLD}DIVERGENCES{END}")
         for d in res["divergences"]:
             print(f"  * {d}")
-    print(f"\n{BOLD}MACRO CROSS-CHECKS{END}")
-    for m in res["macro"]:
-        print(f"  * {m}")
+    if "checks" in only:
+        print(f"\n{BOLD}MACRO CROSS-CHECKS{END}")
+        for m in res["macro"]:
+            print(f"  * {m}")
     p = res["plan"]
     act_col = GREEN if p["action"].startswith(("BUY", "HOLD")) else YEL
-    print(f"\n{BOLD}ACTION{END}  {act_col}{BOLD}{p['action']}{END}   size: {p['size']}")
-    print(f"  manage: {p['management']}")
+    if "plan" in only:
+        print(f"\n{BOLD}ACTION{END}  {act_col}{BOLD}{p['action']}{END}   size: {p['size']}")
+        print(f"  manage: {p['management']}")
     lv = p["levels"]
     tgt = " / ".join(f"{t:.2f}" for t in lv["targets"])
     r1 = f"  (first target = {lv['r_to_first_target']}R)" if lv.get("r_to_first_target") else ""
-    print(f"  entry ~{lv['entry']:.2f}   stop {lv['stop']:.2f}   risk/share {lv['risk_per_share']:.2f}   targets {tgt}{r1}")
-    if "shares_for_risk" in lv:
-        print(f"  size for {lv['risk_amount']:.0f} risk: {BOLD}{lv['shares_for_risk']} shares{END}")
+    if "plan" in only:
+        print(f"  entry ~{lv['entry']:.2f}   stop {lv['stop']:.2f}   risk/share {lv['risk_per_share']:.2f}   targets {tgt}{r1}")
+        if "shares_for_risk" in lv:
+            print(f"  size for {lv['risk_amount']:.0f} risk: {BOLD}{lv['shares_for_risk']} shares{END}")
     ex = res["exit"]
     v = ex["verdict"]
     v_col = RED if v.startswith("EXIT") else YEL if v.startswith(("TRIM", "CAUTION")) else GREEN
-    print(f"\n{BOLD}EXIT ENGINE (as if long TLT){END}  {v_col}{BOLD}{v}{END}")
-    for c in ex["conditions"]:
-        mark_col = RED if c["kind"] == "exit" else YEL
-        mark = f"{mark_col}!{END}" if c["on"] else " "
-        print(f"  [{mark}] {c['name']}")
-    if ex.get("invalidation") is not None:
-        print(f"  invalidation today: a close under {BOLD}{ex['invalidation']:.2f}{END} flips this to EXIT")
-    if ex.get("position"):
-        pos = ex["position"]
-        r_txt = f" ({pos['r_multiple']:+.2f}R)" if pos.get("r_multiple") is not None else ""
-        note = f"   ← {pos['note']}" if pos.get("note") else ""
-        print(f"  position: entry {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt}{note}")
-        if pos.get("be_level") is not None and ex["trail"]["level"] is not None:
-            print(f"  engine trail stays {ex['trail']['level']:.2f} | ≥ +1R → suggest stop to breakeven {pos['be_level']:.2f}")
-    print(f"\n{BOLD}SCHD TAPE{END}  {DIM}(display only — no size, no stop, votes on nothing){END}")
-    for line in schd_lines(res["aux"]):
-        print(f"  * {line}")
-    print(f"\n{BOLD}WHAT FLIPS IT{END}")
-    for f in p["what_flips_it"]:
-        print(f"  -> {f}")
+    if "exit" in only:
+        print(f"\n{BOLD}EXIT ENGINE (as if long TLT){END}  {v_col}{BOLD}{v}{END}")
+        for c in ex["conditions"]:
+            mark_col = RED if c["kind"] == "exit" else YEL
+            mark = f"{mark_col}!{END}" if c["on"] else " "
+            print(f"  [{mark}] {c['name']}")
+        if ex.get("invalidation") is not None:
+            print(f"  invalidation today: a close under {BOLD}{ex['invalidation']:.2f}{END} flips this to EXIT")
+        if ex.get("position"):
+            pos = ex["position"]
+            r_txt = f" ({pos['r_multiple']:+.2f}R)" if pos.get("r_multiple") is not None else ""
+            note = f"   ← {pos['note']}" if pos.get("note") else ""
+            print(f"  position: entry {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt}{note}")
+            if pos.get("be_level") is not None and ex["trail"]["level"] is not None:
+                print(f"  engine trail stays {ex['trail']['level']:.2f} | ≥ +1R → suggest stop to breakeven {pos['be_level']:.2f}")
+    if "schd" in only:
+        print(f"\n{BOLD}SCHD TAPE{END}  {DIM}(display only — no size, no stop, votes on nothing){END}")
+        for line in schd_lines(res["aux"]):
+            print(f"  * {line}")
+    if "plan" in only:
+        print(f"\n{BOLD}WHAT FLIPS IT{END}")
+        for f in p["what_flips_it"]:
+            print(f"  -> {f}")
     alloc = res.get("allocator")
-    if alloc is not None and "error" not in alloc:
+    if alloc is not None and "error" not in alloc and "allocator" in only:
         pos_col = GREEN if alloc["position"].startswith("LONG") else DIM
         since = f" since {alloc['since']} @ {alloc['entry_px']:.2f}" if alloc["since"] else ""
         print(f"\n{BOLD}ALLOCATOR (experimental){END}  {pos_col}{BOLD}{alloc['position']}{END}{since}")
@@ -1128,7 +1162,8 @@ def render_plain(res: dict, demo: bool) -> None:
     print()
 
 
-def render_rich(res: dict, demo: bool) -> None:
+def render_rich(res: dict, demo: bool, only: set[str] | None = None) -> None:
+    only = only if only is not None else set(PANELS)
     from rich import box
     from rich.console import Console, Group
     from rich.panel import Panel
@@ -1209,28 +1244,33 @@ def render_rich(res: dict, demo: bool) -> None:
             ex_group.append(Text(f"engine trail stays {ex['trail']['level']:.2f} | ≥ +1R → suggest stop to breakeven {pos['be_level']:.2f}"))
 
     title = f"TLT DURATION SCANNER — {res['as_of']}" + ("  [DEMO DATA]" if demo else "")
-    console.print(Panel(tape, title=title, border_style="blue"))
-    console.print(
-        Panel(
-            Group(Text(f"REGIME: {reg['label']}  ({reg['score']:+.0f}/±100)", style=reg_style),
-                  Text(f"TREND-TURN STACK: {st['lit']}/{st['of']} — tier {st['tier']}",
-                       style="bold" if st["tier"] != "NONE" else "dim"),
-                  stack_t, b_line),
-            title="signal engine", border_style="magenta",
+    if "scanner" in only:
+        console.print(Panel(tape, title=title, border_style="blue"))
+    if "signals" in only:
+        console.print(
+            Panel(
+                Group(Text(f"REGIME: {reg['label']}  ({reg['score']:+.0f}/±100)", style=reg_style),
+                      Text(f"TREND-TURN STACK: {st['lit']}/{st['of']} — tier {st['tier']}",
+                           style="bold" if st["tier"] != "NONE" else "dim"),
+                      stack_t, b_line),
+                title="signal engine", border_style="magenta",
+            )
         )
-    )
-    if notes.plain:
+    if notes.plain and "checks" in only:
         console.print(Panel(notes, title="cross-checks", border_style="cyan"))
-    console.print(Panel(Group(plan, Text(), flips), title="plan", border_style="green"))
-    console.print(Panel(Group(*ex_group), title="exit engine — as if long TLT",
-                        border_style="red" if v.startswith("EXIT") else "green"))
+    if "plan" in only:
+        console.print(Panel(Group(plan, Text(), flips), title="plan", border_style="green"))
+    if "exit" in only:
+        console.print(Panel(Group(*ex_group), title="exit engine — as if long TLT",
+                            border_style="red" if v.startswith("EXIT") else "green"))
     schd_t = Text()
     for line in schd_lines(res["aux"]):
         schd_t.append(f"{line}\n")
     schd_t.append("display only — no size, no stop, votes on no TLT signal", style="dim")
-    console.print(Panel(schd_t, title="SCHD tape", border_style="blue"))
+    if "schd" in only:
+        console.print(Panel(schd_t, title="SCHD tape", border_style="blue"))
     alloc = res.get("allocator")
-    if alloc is not None and "error" not in alloc:
+    if alloc is not None and "error" not in alloc and "allocator" in only:
         a_t = Table(box=None, pad_edge=False, show_header=False)
         a_t.add_column(width=3)
         a_t.add_column()
@@ -1415,8 +1455,12 @@ def main() -> int:
                     help="run the 4-variant ablation (current / no-SCOUT / no-trail / allocator) at 1bp and 5bp")
     ap.add_argument("--from", dest="from_date", metavar="YYYY-MM-DD",
                     help="start the backtest/ablation window at this date (earlier data used for warmup)")
+    ap.add_argument("--only", metavar="PANELS",
+                    help="render only these panels, comma-separated: " + ", ".join(PANELS) +
+                         f" ({PANEL_HELP}). Does not affect --json.")
     ap.add_argument("--explain", action="store_true", help="print the trading logic and exit")
     args = ap.parse_args()
+    only = parse_only(args.only)
 
     if args.explain:
         print(LOGIC)
@@ -1462,11 +1506,11 @@ def main() -> int:
             use_rich = not args.plain
             if use_rich:
                 try:
-                    render_rich(res, args.demo)
+                    render_rich(res, args.demo, only)
                 except ImportError:
                     use_rich = False
             if not use_rich:
-                render_plain(res, args.demo)
+                render_plain(res, args.demo, only)
         if args.notify:
             prev_action, prev_exit = prev if prev else (None, None)
             if action.startswith("BUY") and action != prev_action:
