@@ -1,0 +1,66 @@
+{
+  "pollSeconds": 15,
+  "offPollSeconds": 60,
+  "quoteHosts": ["query1.finance.yahoo.com", "query2.finance.yahoo.com"],
+  "nearPct": 0.35,
+  "hysteresisPct": 0.1,
+  "alertCooldownMin": 25,
+  "session": {
+    "timezone": "America/New_York",
+    "open": "09:30",
+    "close": "16:00",
+    "lateWarn": "15:45",
+    "soundOutsideSession": false,
+    "chimeOnOpenClose": true
+  },
+  "sounds": {
+    "enabled": true,
+    "voice": true,
+    "map": {
+      "buy-dip": { "file": "/System/Library/Sounds/Glass.aiff", "repeat": 2 },
+      "buy-breakout": { "file": "/System/Library/Sounds/Hero.aiff", "repeat": 3 },
+      "stop-warn": { "file": "/System/Library/Sounds/Basso.aiff", "repeat": 3 },
+      "close-warn": { "file": "/System/Library/Sounds/Sosumi.aiff", "repeat": 2 },
+      "chime": { "file": "/System/Library/Sounds/Ping.aiff", "repeat": 1 }
+    }
+  },
+  "tickers": {
+    "CORN": {
+      "dipEntry": 19.2,
+      "stop": "ema20",
+      "breakout": null,
+      "closeWarnBelow": 19.2,
+      "fallbackLevels": { "ema20": 18.55, "sma50": 17.76, "sma200": 17.88 },
+      "note": "price discovery · most stretched (RSI ~79) · close <19.20 = failed breakout · golden cross pending"
+    },
+    "WEAT": {
+      "dipEntry": 26.4,
+      "stop": "ema20",
+      "breakout": null,
+      "fallbackLevels": { "ema20": 24.99, "sma50": 24.04, "sma200": 22.49 },
+      "note": "double-top breakout · measured move ~28.5-29 · trail = 20-EMA"
+    },
+    "SOYB": {
+      "dipEntry": 26.3,
+      "stop": "ema20",
+      "breakout": null,
+      "fallbackLevels": { "ema20": 25.76, "sma50": 25.26, "sma200": 24.05 },
+      "note": "orderly staircase to new highs · least fragile"
+    },
+    "CANE": {
+      "dipEntry": "ema20",
+      "stop": "sma200",
+      "breakout": 11.5,
+      "fallbackLevels": { "ema20": 10.75, "sma50": 10.05, "sma200": 9.74 },
+      "note": "11.0-11.4 flag above reclaimed 200-day · >11.50 resumes trend · India-ban/ethanol trade"
+    },
+    "DBA": {
+      "dipEntry": "ema20",
+      "stop": "sma50",
+      "breakout": 28.8,
+      "breakoutNote": "Sector breadth confirmed — entire ag complex at new highs.",
+      "fallbackLevels": { "ema20": 28.03, "sma50": 27.59, "sma200": 26.68 },
+      "note": "sector tell · 28.80 = May-high trigger · most room to run (RSI 65)"
+    }
+  }
+}

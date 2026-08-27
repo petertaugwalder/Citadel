@@ -91,3 +91,6 @@ docs/cloud/
 
 # Internal planning and design documents (not user-facing)
 docs/FACELIFT_PLAN.md
+
+# Commodity scanner runtime log
+trading/scanner/alerts.log
