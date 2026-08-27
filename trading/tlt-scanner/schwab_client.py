@@ -17,6 +17,7 @@ Credentials (never committed, never pasted into chat):
 The redirect URI must match your app registration EXACTLY (Schwab requires https).
 
 Usage:
+  python schwab_client.py doctor    # diagnose: creds -> network -> tokens -> data
   python schwab_client.py login     # one-time browser auth; run again weekly
   python schwab_client.py status    # token age / expiry
   python schwab_client.py quote SCHD
@@ -139,24 +140,115 @@ def login() -> None:
     params = {"client_id": cred["app_key"], "redirect_uri": cred["redirect_uri"],
               "response_type": "code"}
     url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
-    print("\n1. Open this URL, log in, and approve the app:\n")
+    print(f"\nusing app key {cred['app_key'][:4]}…{cred['app_key'][-4:]}  "
+          f"redirect_uri {cred['redirect_uri']}")
+    print("(the redirect_uri above must byte-match your app registration exactly)\n")
+    print("1. Open this URL, log in, and approve the app:\n")
     print(f"   {url}\n")
     print("2. Your browser will land on a page that FAILS TO LOAD. That is expected —")
     print(f"   nothing is listening on {cred['redirect_uri']}.")
-    print("3. Copy the FULL address-bar URL of that failed page and paste it below.\n")
-    pasted = input("redirected URL: ").strip()
+    print("3. Copy the FULL address-bar URL of that failed page and paste it below.")
+    print("   ⚠ THE CODE EXPIRES IN ~30 SECONDS. Have this terminal ready and paste fast;")
+    print("     if it fails, just run login again — a stale code is the usual cause.\n")
+    pasted = input("redirected URL (or just the code): ").strip().strip('"\'')
     if not pasted:
         raise SchwabError("nothing pasted")
-    qs = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
-    code = (qs.get("code") or [None])[0]
+    if "code=" in pasted:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
+        code = (qs.get("code") or [None])[0]
+    else:
+        code = pasted  # allow pasting just the code value
     if not code:
-        raise SchwabError("no ?code= parameter in that URL — paste the whole address bar")
-    tok = _post_token(cred, {"grant_type": "authorization_code", "code": code,
-                             "redirect_uri": cred["redirect_uri"]})
+        raise SchwabError("no ?code= found — paste the whole address-bar URL, or just the code value")
+    try:
+        tok = _post_token(cred, {"grant_type": "authorization_code", "code": code,
+                                 "redirect_uri": cred["redirect_uri"]})
+    except SchwabError as e:
+        msg = str(e)
+        hint = ""
+        if "400" in msg:
+            hint = ("\n  likely causes, in order:"
+                    "\n   1. the code expired (>30s between approving and pasting) — just re-run login"
+                    "\n   2. redirect_uri mismatch — it must byte-match the callback on developer.schwab.com"
+                    f" (you sent: {cred['redirect_uri']})"
+                    "\n   3. the code was already used — each one works once")
+        elif "401" in msg:
+            hint = ("\n  401 = the App Key/Secret pair was rejected, or the app is still"
+                    " 'Approved - Pending' on developer.schwab.com")
+        raise SchwabError(msg + hint) from None
     print(f"\n✓ logged in. Tokens saved to {TOKEN_FILE} (chmod 600).")
     print(f"  access token valid ~30 min (auto-refreshed); refresh token expires "
           f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(tok['refresh_expires_at']))} "
           f"— re-run 'login' after that.")
+
+
+def doctor() -> None:
+    """Check every prerequisite in order and say exactly which step is broken."""
+    ok, fail = "  \u2713", "  \u2717"
+    print("\nSchwab connection doctor\n" + "=" * 46)
+    print(f"{ok} python {sys.version.split()[0]}")
+
+    try:
+        cred = load_credentials()
+        src = "environment" if os.environ.get("SCHWAB_APP_KEY") else str(CRED_FILE)
+        k = cred["app_key"]
+        print(f"{ok} credentials found via {src}")
+        print(f"      app key    : {k[:4]}…{k[-4:]}  ({len(k)} chars)")
+        print(f"      secret     : {'set' if cred.get('app_secret') else 'MISSING'} "
+              f"({len(cred.get('app_secret') or '')} chars)")
+        print(f"      redirect   : {cred['redirect_uri']}")
+        if cred["redirect_uri"] != DEFAULT_REDIRECT:
+            print(f"      note: differs from the default {DEFAULT_REDIRECT} — it must match your app")
+    except SchwabError as e:
+        print(f"{fail} credentials: {e}")
+        print("      fix: export SCHWAB_APP_KEY=... and SCHWAB_APP_SECRET=... in THIS shell")
+        print("      (env vars do not survive a new tab — re-export or use the config file)")
+        return
+
+    import socket
+    try:
+        socket.create_connection(("api.schwabapi.com", 443), timeout=10).close()
+        print(f"{ok} network: api.schwabapi.com:443 reachable")
+    except Exception as e:
+        print(f"{fail} network: cannot reach api.schwabapi.com ({type(e).__name__})")
+        print("      fix: check VPN/firewall — the OAuth and data calls both need this host")
+        return
+
+    tok = load_tokens()
+    if not tok:
+        print(f"{fail} tokens: none stored at {TOKEN_FILE}")
+        print("      fix: run  python schwab_client.py login")
+        return
+    now = time.time()
+    a, r = tok.get("access_expires_at", 0), tok.get("refresh_expires_at", 0)
+    print(f"{ok if now < r else fail} tokens: access {(a - now) / 60:+.0f} min, "
+          f"refresh {(r - now) / 86400:+.1f} days  ({TOKEN_FILE})")
+    if now >= r:
+        print("      fix: refresh token expired (7-day limit) — run login again")
+        return
+
+    try:
+        get_access_token()
+        print(f"{ok} token refresh works")
+    except SchwabError as e:
+        print(f"{fail} token refresh: {e}")
+        return
+
+    try:
+        q = quote("SCHD")
+        last = (q.get("SCHD", {}).get("quote", {}) or {}).get("lastPrice")
+        print(f"{ok} market data: SCHD quote returned (last {last})")
+    except SchwabError as e:
+        print(f"{fail} market data: {e}")
+        print("      401/403 here usually means the app is not yet approved for Market Data")
+        return
+
+    try:
+        c = pick_call("SCHD")
+        print(f"{ok} option chain: {c['expiry']} {c['strike']} call, delta {c['delta']}, OI {c['open_interest']}")
+        print("\nall good — run:  python tlt_scanner.py --options")
+    except SchwabError as e:
+        print(f"{fail} option chain: {e}")
 
 
 def status() -> None:
@@ -280,6 +372,8 @@ def main() -> int:
             login()
         elif cmd == "status":
             status()
+        elif cmd == "doctor":
+            doctor()
         elif cmd == "logout":
             logout()
         elif cmd == "quote":
