@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Ag-commodity call-entry scanner — WEAT · CORN · SOYB · CANE · DBA
+ * Commodity call-entry scanner — WEAT · CORN · SOYB · CANE · DBA · IAU · SLV
  *
  * Watches live prices during the NY regular session (09:30–16:00) and fires
  * sound + iTerm2 alerts when a ticker hits a planned call-entry condition:
@@ -11,8 +11,9 @@
  *   close-warn    late-session failure check (CORN < 19.20 after 15:45 NY)
  *
  * Zero dependencies, Node >= 18. Levels live in config.json; "ema20",
- * "sma50", "sma200" resolve live from daily data each poll so trailing
- * references track the chart without manual edits.
+ * "sma50", "sma200", "high20" and "high50" resolve live from daily data each
+ * poll, so trailing references and N-day-high triggers track the chart
+ * without manual edits.
  *
  *   node commodity-scanner.js               live dashboard (run inside iTerm2)
  *   node commodity-scanner.js --once        one poll, plain table, exit
@@ -36,7 +37,7 @@ const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const ALERT_LOG = path.join(__dirname, 'alerts.log');
-const DYN_LEVELS = new Set(['ema20', 'sma50', 'sma200']);
+const DYN_LEVELS = new Set(['ema20', 'sma50', 'sma200', 'high20', 'high50']);
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -154,6 +155,11 @@ function emaLast(closes, period) {
   let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
   for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
   return ema;
+}
+
+function maxLast(values, period) {
+  if (!Array.isArray(values) || values.length < period) return null;
+  return values.slice(-period).reduce((a, b) => (b > a ? b : a), -Infinity);
 }
 
 function smaLast(closes, period) {
@@ -468,15 +474,18 @@ function parseIntraday(result) {
   };
 }
 
-function parseDailyCloses(result, todayKey) {
+function parseDaily(result, todayKey) {
   const ts = result.timestamp || [];
-  const closes = result.indicators?.quote?.[0]?.close || [];
-  const out = [];
+  const q = result.indicators?.quote?.[0] || {};
+  const closes = q.close || [];
+  const highs = q.high || [];
+  const out = { closes: [], highs: [] };
   for (let i = 0; i < ts.length; i++) {
     const c = closes[i];
     if (!Number.isFinite(c)) continue;
     if (nyParts(new Date(ts[i] * 1000)).dateKey === todayKey) continue; // forming candle
-    out.push(c);
+    out.closes.push(c);
+    out.highs.push(Number.isFinite(highs[i]) ? highs[i] : c);
   }
   return out;
 }
@@ -509,7 +518,7 @@ class YahooFeed {
             range: '1y',
             includePrePost: 'false',
           });
-          this.dailies.set(sym, parseDailyCloses(res, today));
+          this.dailies.set(sym, parseDaily(res, today));
         } catch {
           // keep whatever we had; fallbackLevels cover a cold start
         }
@@ -563,12 +572,16 @@ class YahooFeed {
   }
 
   indicatorsFor(sym, livePrice) {
-    const closes = this.dailies.get(sym);
-    if (!closes || closes.length < 20) return null;
+    const daily = this.dailies.get(sym);
+    if (!daily || daily.closes.length < 20) return null;
+    const { closes, highs } = daily;
     return {
       ema20: liveEma(closes, livePrice, 20),
       sma50: liveSma(closes, livePrice, 50),
       sma200: liveSma(closes, livePrice, 200),
+      // Prior N completed sessions only — today must exceed it to trigger.
+      high20: maxLast(highs, 20),
+      high50: maxLast(highs, 50),
     };
   }
 
@@ -586,6 +599,8 @@ const SIM_PATHS = {
   SOYB: [26.75, 26.6, 26.5, 26.42, 26.36, 26.31, 26.28, 26.3, 26.35, 26.4, 26.45, 26.5, 26.52, 26.55, 26.55, 26.55, 26.55, 26.55, 26.55, 26.55],
   CANE: [11.23, 11.26, 11.29, 11.32, 11.36, 11.4, 11.44, 11.47, 11.52, 11.58, 11.6, 11.55, 11.53, 11.56, 11.58, 11.6, 11.6, 11.6, 11.6, 11.6],
   DBA: [28.59, 28.63, 28.68, 28.74, 28.79, 28.84, 28.9, 28.71, 28.4, 28.02, 27.8, 27.55, 27.62, 27.9, 28.05, 28.1, 28.15, 28.2, 28.2, 28.2],
+  IAU: [80.0, 79.6, 79.1, 78.6, 78.1, 77.55, 77.2, 77.4, 78.0, 78.8, 79.6, 80.4, 81.1, 81.7, 82.1, 82.4, 82.6, 82.7, 82.8, 82.9],
+  SLV: [45.0, 44.7, 44.4, 44.0, 43.6, 43.3, 43.5, 44.1, 44.8, 45.4, 45.95, 46.4, 46.2, 45.8, 46.1, 46.5, 46.7, 46.8, 46.9, 47.0],
 };
 const SIM_STEPS = 20;
 
@@ -641,8 +656,18 @@ class SimFeed {
     };
   }
 
+  // Synthetic levels, so tickers configured without fallbacks still demo.
   indicatorsFor(sym) {
-    return this.cfg.tickers[sym]?.fallbackLevels ?? null;
+    const p0 = SIM_PATHS[sym]?.[0];
+    if (!Number.isFinite(p0)) return this.cfg.tickers[sym]?.fallbackLevels ?? null;
+    return {
+      ema20: p0 * 0.97,
+      sma50: p0 * 0.93,
+      sma200: p0 * 0.85,
+      high20: p0 * 1.015,
+      high50: p0 * 1.02,
+      ...(this.cfg.tickers[sym]?.fallbackLevels ?? {}),
+    };
   }
 
   errorSummary() {
@@ -786,7 +811,7 @@ class Scanner {
       const summary = [...this.rows.entries()]
         .map(([s, r]) => `${s} ${fmt(r.quote?.price)}`)
         .join(' · ');
-      setTitle(`AG scanner · ${summary}`);
+      setTitle(`Commodity scanner · ${summary}`);
     }
   }
 
@@ -806,7 +831,7 @@ class Scanner {
     const errSum = this.feed.errorSummary?.();
 
     lines.push(
-      `${C.bold}AG CALL SCANNER${C.reset}  ${Object.keys(cfg.tickers).join(' ')}   ${clock}  ${mkt}  ${C.dim}poll ${cfg.pollSeconds}s · next ${nextIn}s${C.reset}${errSum ? `  ${C.red}quote errs: ${errSum}${C.reset}` : ''}`,
+      `${C.bold}COMMODITY CALL SCANNER${C.reset}  ${Object.keys(cfg.tickers).join(' ')}   ${clock}  ${mkt}  ${C.dim}poll ${cfg.pollSeconds}s · next ${nextIn}s${C.reset}${errSum ? `  ${C.red}quote errs: ${errSum}${C.reset}` : ''}`,
     );
     lines.push(C.gray + '─'.repeat(100) + C.reset);
     lines.push(
@@ -943,7 +968,7 @@ async function runLive(cfg, opts) {
 
   if (IS_TTY && !opts.once) {
     process.stdout.write('\x1b[2J\x1b[H\x1b[?25l');
-    setBadge('AG');
+    setBadge('CMDTY');
   }
   const cleanup = () => {
     if (IS_TTY) process.stdout.write('\x1b[?25h' + C.reset + '\n');
@@ -1029,10 +1054,13 @@ function runCheck(configPath) {
     t(`loads and validates (${err.message})`, false);
   }
   if (cfg) {
-    t('has all 5 tickers', ['WEAT', 'CORN', 'SOYB', 'CANE', 'DBA'].every((s) => cfg.tickers[s]));
     t(
-      'every ticker has fallback levels',
-      Object.values(cfg.tickers).every((tk) => tk.fallbackLevels?.ema20 > 0),
+      'has all 7 tickers',
+      ['WEAT', 'CORN', 'SOYB', 'CANE', 'DBA', 'IAU', 'SLV'].every((s) => cfg.tickers[s]),
+    );
+    t(
+      'declared fallback levels are sane',
+      Object.values(cfg.tickers).every((tk) => !tk.fallbackLevels || tk.fallbackLevels.ema20 > 0),
     );
     t(
       'sim paths cover configured tickers',
@@ -1045,6 +1073,7 @@ function runCheck(configPath) {
   t('ema known small case', approx(emaLast([2, 4, 6, 8], 3), 6));
   t('liveEma folds price', approx(liveEma([2, 4, 6, 8], 10, 3), 8));
   t('sma', approx(smaLast([1, 2, 3, 4, 5], 5), 3));
+  t('maxLast window', maxLast([5, 9, 3, 7], 3) === 9 && maxLast([1], 5) === null);
   t('liveSma folds price', approx(liveSma([1, 2, 3, 4], 5, 5), 3));
   t('short series -> null', emaLast([1, 2], 20) === null && liveSma([1], 2, 50) === null);
 
@@ -1066,10 +1095,14 @@ function runCheck(configPath) {
   t('intraday trading period', iq.tradingPeriod.start === nowSec - 3600);
   const dailyFixture = {
     timestamp: [nowSec - 3 * 86400, nowSec - 2 * 86400, nowSec],
-    indicators: { quote: [{ close: [10, 11, 12] }] },
+    indicators: { quote: [{ close: [10, 11, 12], high: [10.5, null, 12.5] }] },
   };
-  const closes = parseDailyCloses(dailyFixture, nyParts().dateKey);
-  t("daily parse drops today's forming candle", closes.length === 2 && closes[1] === 11);
+  const daily = parseDaily(dailyFixture, nyParts().dateKey);
+  t("daily parse drops today's forming candle", daily.closes.length === 2 && daily.closes[1] === 11);
+  t(
+    'daily parse keeps highs, falling back to close',
+    daily.highs.length === 2 && daily.highs[0] === 10.5 && daily.highs[1] === 11,
+  );
 
   console.log('levels');
   const ind = { ema20: 18.57, sma50: 17.8, sma200: 17.9 };
@@ -1082,6 +1115,19 @@ function runCheck(configPath) {
   t('fallback used when no live data', approx(lv2.dipEntry.value, 10.75) && lv2.dipEntry.approx === true);
   const lv3 = resolveLevels({ dipEntry: 19.2, stop: 'ema20' }, { ema20: 19.5 });
   t('inverted zone follows trailing stop', lv3.inverted === true && approx(lv3.dipEntry.value, 19.5));
+  const lv4 = resolveLevels(
+    { dipEntry: 'ema20', stop: 'sma50', breakout: 'high50' },
+    { ...ind, high20: 20.1, high50: 20.4 },
+  );
+  t(
+    'dynamic N-day-high breakout',
+    approx(lv4.breakout.value, 20.4) && lv4.breakout.label === 'high50',
+  );
+  t('unknown level spec rejected', validateConfig({
+    pollSeconds: 15,
+    session: { open: '09:30', close: '16:00' },
+    tickers: { XYZ: { breakout: 'high999' } },
+  }).some((e) => e.includes('bad level spec')));
 
   console.log('state machine');
   const tcfg = { dipEntry: 28.03, stop: 27.59, breakout: 28.8 };
