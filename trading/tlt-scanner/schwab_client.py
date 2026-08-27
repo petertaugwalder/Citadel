@@ -150,18 +150,20 @@ def _ensure_cert() -> bool:
     if not shutil.which("openssl"):
         return False
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        subprocess.run(
-            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
-             "-keyout", str(KEY_FILE), "-out", str(CERT_FILE),
-             "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
-            check=True, capture_output=True, timeout=60,
-        )
-        KEY_FILE.chmod(0o600)
-        CERT_FILE.chmod(0o600)
-        return True
-    except Exception:
-        return False
+    base = ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+            "-keyout", str(KEY_FILE), "-out", str(CERT_FILE), "-subj", "/CN=127.0.0.1"]
+    # macOS ships LibreSSL, where -addext may not exist; the SAN is cosmetic here
+    # because the browser warning is click-through either way.
+    for cmd in (base + ["-addext", "subjectAltName=IP:127.0.0.1"], base):
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+            KEY_FILE.chmod(0o600)
+            CERT_FILE.chmod(0o600)
+            return True
+        except Exception as e:
+            last = e
+    print(f"   (self-signed cert generation failed: {type(last).__name__})")
+    return False
 
 
 def _capture_code(redirect_uri: str, timeout: int = 300) -> str | None:
@@ -195,8 +197,20 @@ def _capture_code(redirect_uri: str, timeout: int = 300) -> str | None:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-    srv.timeout = timeout
-    t = threading.Thread(target=srv.handle_request, daemon=True)
+    srv.timeout = 1  # short poll so the deadline below is what actually governs
+    deadline = time.time() + timeout
+
+    def serve():
+        # keep serving: the browser's cert-warning click aborts one handshake, and
+        # some browsers also fetch /favicon.ico, either of which would otherwise
+        # consume the single request we care about
+        while time.time() < deadline and not box.get("code") and not box.get("error"):
+            try:
+                srv.handle_request()
+            except Exception:
+                continue
+
+    t = threading.Thread(target=serve, daemon=True)
     t.start()
     t.join(timeout)
     srv.server_close()
@@ -478,6 +492,14 @@ def main() -> int:
             return 1
     except SchwabError as e:
         print(f"schwab: {e}", file=sys.stderr)
+        if "--verbose" in args:
+            import traceback
+            traceback.print_exc()
+        return 1
+    except Exception as e:
+        print(f"schwab: unexpected {type(e).__name__}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         return 1
     except KeyboardInterrupt:
         return 130
