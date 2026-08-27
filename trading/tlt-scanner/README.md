@@ -168,6 +168,27 @@ The bounce is now a tape signal only — it is never presented as a new entry.
 Judge the allocator with `--ablate`, which compares all four variants at 1bp
 and 5bp on the same window; every variant is in-sample.
 
+## Web dashboard (`webapp.py`)
+
+The same engines rendered as a page instead of terminal panels — useful on a
+phone or a second monitor. Stdlib only (no Flask), read-only, places no orders.
+
+```bash
+python webapp.py                      # http://127.0.0.1:8787
+python webapp.py --lan                # also reachable from your phone on the LAN
+python webapp.py --entry 83.10 --schd-entry 34.20 --options --account 50000
+python webapp.py --port 9000 --refresh-min 10
+```
+
+Cards: tape (with a 60-session TLT sparkline), TLT regime + stack checklist,
+TLT plan with levels and sizing, TLT exit engine with the invalidation price,
+the SCHD call-timing overlay, an optional SCHD calls panel, and "what flips
+it". Light/dark follow the OS; the layout collapses to one column on a phone.
+`/api` serves the same data as JSON, `/health` for uptime checks.
+
+Numbers come from the identical `analyze()` call the CLI uses, cached for
+`--refresh-min` (default 15) with a manual **refresh** link.
+
 ## Schwab connection (real option greeks)
 
 The call panel uses Schwab's Trader API when you're logged in — real greeks and
@@ -244,3 +265,4 @@ python tlt_scanner.py --options
 - SCHD ablation (4 entry/exit variants), price-only benchmark, and a call-buyer options panel.
 - SCHD reframed as a call-timing overlay: --schd-exit swing/reduce/trend (default trend), no share sizing.
 - Schwab Trader API client for real option greeks (stdlib only); yfinance fallback retained.
+- Local web dashboard (webapp.py): same engines, browser UI, /api JSON, phone-friendly.
