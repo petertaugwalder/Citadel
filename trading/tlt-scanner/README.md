@@ -2,12 +2,13 @@
 
 Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 **UB futures** (Ultra T-Bond) and the **30y yield (^TYX)** as confirming tape.
-TLT is the only trade vehicle. **The tape is the product; `--allocate` is an
-experimental allocator layered on top** (binary gate, details below).
-Shown on the tape: **TLT / UB / ^TYX** (the duration triangle) plus **SCHD**,
-a display-only equity-income sleeve that votes on nothing. Fetched quietly as
-a derived input, never shown as a row and never required: **^TNX** (10s30s
-display one-liner), plus TLT's live effective duration.
+**The tape is the product; `--allocate` is an experimental allocator layered
+on top** (binary gate, details below).
+**Two traded legs: TLT and SCHD**, each with its own engine, walled off from
+one another. Tape rows: **TLT / UB / ^TYX** (the duration triangle) plus
+**SCHD** (the equity leg). Fetched quietly as a derived input, never shown as
+a row and never required: **^TNX** (10s30s one-liner), plus TLT's live
+effective duration.
 Daily (end-of-day) data from Yahoo Finance, cached locally. Built for iTerm —
 rich TUI dashboard with a plain-ANSI fallback.
 
@@ -36,6 +37,8 @@ python tlt_scanner.py --explain   # the trading logic, in the terminal
 | `python tlt_scanner.py --ablate --from 2020-01-01` | 4-variant ablation (current / no-SCOUT / no-trail / allocator) at 1bp and 5bp; `--from` sets the window start |
 | `python tlt_scanner.py --watch 900 --notify` | Re-scan every 15 min, macOS notification on a new BUY |
 | `python tlt_scanner.py --account 50000 --risk 1.0` | Adds position sizing (risk 1% of $50k per trade) |
+| `python tlt_scanner.py --backtest --schd` | Backtest the SCHD leg against SCHD buy-and-hold |
+| `python tlt_scanner.py --schd-entry 28.50` | Adds open P&L and R-multiple to the SCHD leg |
 | `python tlt_scanner.py --entry 82.50` | Adds open P&L and R-multiple to the exit engine, plus a stop-to-breakeven suggestion past +1R |
 | `python tlt_scanner.py --json` | Machine-readable output for piping |
 | `python tlt_scanner.py --alert-exit` | Exit code 2 on a BUY, 3 on an EXIT — for scripting/cron |
@@ -80,11 +83,23 @@ STEEPENING/FLATTENING one-liner. Only bear-steepening during an active
 bounce adds a CAUTION-class warning — never an EXIT, never a buy/sell
 boolean.
 
-**SCHD sleeve — display only.** SCHD gets a tape row and its own `SCHD tape`
-panel (position vs its own 50/200-day, and its 20-day % read as stocks bid or
-offered while you trade TLT). It is **not** part of the duration triangle: it
-never votes on regime, stack, bounce, `--allocate`, or any TLT
-EXIT/TRIM/CAUTION, carries no size or stop, and never fires a notification.
+## The SCHD leg (traded, separate engine)
+
+SCHD is a quality/dividend equity ETF in a durable uptrend, so it gets
+**trend rules, not TLT's mean-reversion rules** — nothing is shared between
+the two engines, in either direction.
+
+- **Trend gate** (all three, else stand aside): close > 200-day, 50-day >
+  200-day, 50-day rising.
+- **Entries**: **PULLBACK** — tagged the 20-EMA within 3 sessions and closed
+  back above it; **BREAKOUT** — a new 20-day closing high.
+- **Exits**: close < 50-day reduces; close < 200-day exits. No 21-EMA trail.
+- **Risk**: stop = 20-day swing low − 0.5×ATR; size = (account × risk%) ÷
+  (entry − stop); first target +2R. `--schd-entry 28.50` adds open P&L and
+  R-multiple.
+- **Backtest**: `--backtest --schd` (compared against SCHD buy-and-hold).
+  SCHD's dividends compound for holders, so beating buy-and-hold is the bar —
+  and the in-sample caveat applies exactly as it does to TLT.
 
 **Layer 4 — EXIT ENGINE** (the sell signal, evaluated "as if long"):
 **EXIT** on a close under the trail (21-EMA for rentals/swings, 50-day after a
@@ -161,3 +176,4 @@ and 5bp on the same window; every variant is in-sample.
 
 - ZB removed, UB only.
 - DBA and DBC removed; SCHD added display-only.
+- SCHD promoted to a traded leg with its own trend engine and backtest.
