@@ -1,13 +1,13 @@
 # TLT Duration Scanner
 
 Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
-**ZB futures** (30y T-Bond) and the **30y yield (^TYX)** as confirming tape.
+**UB futures** (Ultra T-Bond) and the **30y yield (^TYX)** as confirming tape.
 TLT is the only trade vehicle. **The tape is the product; `--allocate` is an
 experimental allocator layered on top** (binary gate, details below).
-Shown on the tape: **TLT / ZB / ^TYX / DBA**.
+Shown on the tape: **TLT / UB / ^TYX / DBA**.
 Fetched quietly as derived inputs, never shown as rows and never required:
-**UB=F** (Ultra Bond confirmation line), **^TNX** (10s30s display one-liner),
-**DBC** (broad-commodity co-flag), plus TLT's live effective duration.
+**^TNX** (10s30s display one-liner) and **DBC** (broad-commodity co-flag),
+plus TLT's live effective duration.
 Daily (end-of-day) data from Yahoo Finance, cached locally. Built for iTerm —
 rich TUI dashboard with a plain-ANSI fallback.
 
@@ -54,7 +54,7 @@ Cron-style alerting without keeping a window open:
 ## The model
 
 **Layer 1 — REGIME** (−100…+100): moving-average structure (price vs 50/200-day,
-50-day slope, 50 vs 200) scored across TLT and ZB, plus the same tests inverted
+50-day slope, 50 vs 200) scored across TLT and UB, plus the same tests inverted
 on ^TYX. The regime never generates entries — it decides **size and holding
 period**: bear regime = rent bounces; transition = scout; bull = hold and add.
 
@@ -65,30 +65,30 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
   two bars). Capitulation → exhaustion → first demand. In a bear regime, profits
   are taken into the 50/200-day band, where bear-market rallies die.
 - **TREND-TURN STACK** (8 conditions): TLT 9>21 EMA, MACD cross, 50-day reclaim,
-  50-day slope up, higher swing low; ZB momentum cross, ZB 50-day reclaim;
+  50-day slope up, higher swing low; UB momentum cross, UB 50-day reclaim;
   ^TYX below its 50-day. Tiers: **3/8 = SCOUT** (1/3 size), **5/8 = CONFIRMED**
   (2/3), **close > 200-day = REGIME FLIP** (full). Bottoms are processes — each
   condition is a brick, and confirmation deliberately costs a worse price in
   exchange for better odds.
 
 **Layer 3 — CROSS-CHECKS**: TLT bullish RSI divergence, ^TYX yield-exhaustion
-divergence, ZB/TLT momentum disagreement (ZB leads by hours), and the DBA
+divergence, UB/TLT momentum disagreement (UB leads by hours), and the DBA
 commodity tape as a **coarse secondary inflation flag** — DBA is agriculture
 futures, not CPI; food is one slice of bond-relevant inflation, and a DBA
 spike can be weather or cocoa saying nothing about 30y term premium.
 The aux inputs add display lines here: live duration (`D≈…` with the
 first-order Δy mapping, STALE-marked 15.0 fallback), a 5-session
 actual-vs-duration-implied residual (cross-check only), the 10s30s
-STEEPENING/FLATTENING one-liner, a `UB confirm` aligned/SPLIT line, and
-`| broad (DBC)` appended to the inflation line. Three of these can each add
-one CAUTION-class warning (ZB/UB split; bear-steepening during an active
-bounce; DBA and DBC hot together) — never an EXIT, never a buy/sell boolean.
+STEEPENING/FLATTENING one-liner, and `| broad (DBC)` appended to the
+inflation line. Two of these can each add one CAUTION-class warning
+(bear-steepening during an active bounce; DBA and DBC hot together) —
+never an EXIT, never a buy/sell boolean.
 
 **Layer 4 — EXIT ENGINE** (the sell signal, evaluated "as if long"):
 **EXIT** on a close under the trail (21-EMA for rentals/swings, 50-day after a
 regime flip) or under the prior 15-day low (the structure stop). **TRIM** on a
 50-day tag-and-reject in a bear regime, or RSI ≥ 70. **CAUTION** when ≥ 2 early
-warnings fire: ZB futures lose their 21-EMA, 30y-yield momentum turns back up,
+warnings fire: UB futures lose their 21-EMA, 30y-yield momentum turns back up,
 or a bearish RSI divergence forms on the highs. `--notify` alerts on new
 EXIT/TRIM verdicts as well as BUYs.
 
@@ -111,7 +111,7 @@ CONFIRMED/FLIP opens. No thresholds were changed on this result.
 
 The tape never changes; the allocator is a separate, deliberately dumb layer
 built from thresholds the tape already computes (nothing retuned): **new
-longs only when 30y yield < its 50-day AND ZB > its 50-day AND TLT > its
+longs only when 30y yield < its 50-day AND UB > its 50-day AND TLT > its
 50-day; size binary 1.0/0; no SCOUT opens, no bounce opens, no trims; exits
 on a close under the prior 15-day low or the 50-day (never the 21-EMA).**
 The bounce is now a tape signal only — it is never presented as a new entry.
@@ -125,22 +125,19 @@ and 5bp on the same window; every variant is in-sample.
   constant; it shifts with yield levels and coupon mix (~15 as of late Aug
   2026, per BlackRock ~14.97). Convexity, curve twist, dividends, and NAV
   premium/discount mean realized moves won't match the estimate.
-- **One market, three quotes.** Cash 30y yields, ZB, and TLT co-move in
-  overlapping hours; there is no strict causal chain. ZB's edge is *hours*
+- **One market, three quotes.** Cash 30y yields, UB, and TLT co-move in
+  overlapping hours; there is no strict causal chain. UB's edge is *hours*
   (Globex Sun 5pm CT–Fri 4pm CT, 1h daily halt): it discovers price while TLT
   is closed, so TLT often gaps at the cash open.
-- **ZB is not a 1:1 TLT clone.** Its classic deliverable basket is 15–25y
-  remaining maturity vs TLT's 20+y cash basket; basis, cheapest-to-deliver,
-  and conversion factors keep them close, not identical. Ultra Bond (UB) is
-  the tighter duration proxy if we ever swap; ZB stays for liquidity and the
-  23h session.
+- **UB is the only futures leg.** Ultra T-Bond's 25y+ deliverable basket is
+  the closest listed futures to TLT's 20+y cash basket. Not a 1:1 clone —
+  basis, cheapest-to-deliver, and conversion factors keep them close, not
+  identical — but it is the tightest available proxy. A missing UB feed
+  degrades the scan like a missing ^TYX; no substitute is invented.
 - **^TNX is not a watchlist ticker.** It is fetched privately only for the
   10s30s display line (bear steepener = worse for TLT, bull flattener =
   better) — there is no curve trade and no curve EXIT. ^TYX remains the
   single driver in the signal logic.
-- **UB is a confirmation line, not a signal source.** ZB stays the primary
-  23h tape and keeps the 21-EMA warning; a ZB/UB disagreement is CAUTION
-  fuel only, and a missing UB feed never fails a scan.
 - **Duration is displayed live, used nowhere.** D comes from Yahoo fund data
   on a weekly cache and falls back to 15.0 marked STALE; the
   actual-vs-implied residual it enables is a cross-check line only.
@@ -157,3 +154,7 @@ and 5bp on the same window; every variant is in-sample.
 
 - `tlt_scanner.py` — everything (single file, no project structure needed)
 - `requirements.txt` — pandas, numpy, yfinance, rich
+
+## Changelog
+
+- ZB removed, UB only.

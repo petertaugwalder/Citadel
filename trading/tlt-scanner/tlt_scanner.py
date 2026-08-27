@@ -4,23 +4,23 @@ tlt_scanner.py — terminal scanner for swing-trading TLT (iShares 20+ Year Trea
 
 Three-layer model:
   1. REGIME   — where are we in the bond cycle? Scored -100..+100 from moving-average
-                structure on TLT, ZB futures (30y T-Bond), and the 30y yield (^TYX, inverted).
+                structure on TLT, UB futures (Ultra T-Bond), and the 30y yield (^TYX, inverted).
   2. TRIGGERS — two buy families:
                   * BOUNCE  — mean-reversion long off an oversold hook (valid in any regime,
                               rented back to the moving-average band in a bear regime).
-                  * TREND-TURN STACK — 8 confirmation conditions across TLT / ZB / ^TYX that
+                  * TREND-TURN STACK — 8 confirmation conditions across TLT / UB / ^TYX that
                               light up as a downtrend actually reverses. Tiers: SCOUT >= 3,
                               CONFIRMED >= 5, REGIME FLIP = close over the 200-day.
   3. CROSS-CHECKS — futures/cash divergence, yield-exhaustion divergence, and the
                 commodity (DBA) tape as a coarse secondary inflation flag (ag
-                futures, not CPI). Quietly-fetched aux inputs — UB futures, ^TNX,
-                DBC — feed display lines (live duration, 10s30s one-liner, broad
-                inflation co-flag, UB confirmation) and CAUTION-class warnings
-                only; none is required for a scan and none is a watchlist row.
+                futures, not CPI). Quietly-fetched aux inputs — ^TNX and DBC — feed
+                display lines (live duration, 10s30s one-liner, broad inflation
+                co-flag) and CAUTION-class warnings only; neither is required
+                for a scan and neither is a watchlist row.
   4. EXIT ENGINE — the sell signal, evaluated "as if long": trail breaks (21-EMA for
                 rentals/swings, 50-day once the regime flipped), a hard structure stop
                 (close under the prior 15-day low), trim-into-strength triggers, and
-                early warnings from ZB futures and the 30y yield. Always prints the
+                early warnings from UB futures and the 30y yield. Always prints the
                 invalidation price (the close that flips today's verdict to EXIT).
                 Pass --entry to see your open P&L and R-multiple against the current
                 stop, plus a stop-to-breakeven suggestion once past +1R.
@@ -55,13 +55,12 @@ warnings.filterwarnings("ignore")
 
 TICKERS = {  # the watchlist — the only rows shown on the tape
     "TLT": "TLT",     # trade vehicle: 20+yr Treasury ETF — the only thing traded
-    "ZB": "ZB=F",     # T-Bond futures: leading tape by hours (15-25y basket; UB is the tighter proxy)
+    "UB": "UB=F",     # Ultra Bond futures: primary futures tape (25y+ basket, tightest match to TLT's book)
     "TYX": "^TYX",    # 30y yield index (drives TLT, inverted)
     "DBA": "DBA",     # ag futures: coarse secondary inflation flag (not CPI)
 }
 AUX_TICKERS = {  # fetched quietly as derived inputs — never shown as watchlist rows,
                  # never required: a scan runs fine with any or all of these missing
-    "UB": "UB=F",    # Ultra Bond futures: tighter proxy for TLT's 20+y book; confirmation line only
     "TNX": "^TNX",   # 10y yield: private input for the 10s30s display one-liner (no curve trade)
     "DBC": "DBC",    # broad commodity basket: informational co-flag for the DBA ag tape
 }
@@ -225,7 +224,6 @@ def demo_frames() -> dict[str, pd.DataFrame]:
     n = 780
     shapes = {
         "TLT": (102.0, [(0.55, -0.13), (0.25, -0.05), (0.17, -0.055), (0.03, 0.028)], 0.0055),
-        "ZB": (128.0, [(0.55, -0.10), (0.25, -0.04), (0.17, -0.045), (0.03, 0.018)], 0.0045),
         "TYX": (4.10, [(0.55, 0.16), (0.25, 0.05), (0.17, 0.055), (0.03, -0.021)], 0.0065),
         "DBA": (26.0, [(0.70, 0.02), (0.15, -0.03), (0.15, 0.105)], 0.0060),
         "UB": (135.0, [(0.55, -0.12), (0.25, -0.05), (0.17, -0.05), (0.03, 0.015)], 0.0050),
@@ -285,7 +283,7 @@ def regime_components(frames: dict) -> list[dict]:
     def add(name, value, weight):
         comps.append({"name": name, "bullish": bool(value) if value is not None else None, "weight": weight})
 
-    for key, label, invert in (("TLT", "TLT", False), ("ZB", "ZB futures", False), ("TYX", "30y yield", True)):
+    for key, label, invert in (("TLT", "TLT", False), ("UB", "UB futures", False), ("TYX", "30y yield", True)):
         df = frames.get(key)
         if df is None or pd.isna(_last(df, "sma200")):
             for suffix, w in ((" vs 200d", 2), (" vs 50d", 1), (" 50d slope", 1), (" 50d vs 200d", 1)):
@@ -346,8 +344,8 @@ def bounce_state(tlt: pd.DataFrame) -> dict:
 
 
 def trend_stack(frames: dict) -> list[dict]:
-    """The 8-condition regime-turn checklist across TLT, ZB and the 30y yield."""
-    tlt, zb, tyx = frames.get("TLT"), frames.get("ZB"), frames.get("TYX")
+    """The 8-condition regime-turn checklist across TLT, UB futures and the 30y yield."""
+    tlt, ub, tyx = frames.get("TLT"), frames.get("UB"), frames.get("TYX")
     items: list[dict] = []
 
     def add(name, val):
@@ -366,10 +364,10 @@ def trend_stack(frames: dict) -> list[dict]:
                      "TLT 50-day rising", "TLT higher swing low"):
             add(name, None)
     add(
-        "ZB 9>21 EMA + MACD cross",
-        None if zb is None else (_last(zb, "ema9") > _last(zb, "ema21") and _last(zb, "macd") > _last(zb, "macd_sig")),
+        "UB 9>21 EMA + MACD cross",
+        None if ub is None else (_last(ub, "ema9") > _last(ub, "ema21") and _last(ub, "macd") > _last(ub, "macd_sig")),
     )
-    add("ZB close > 50-day", None if zb is None else _last(zb, "Close") > _last(zb, "sma50"))
+    add("UB close > 50-day", None if ub is None else _last(ub, "Close") > _last(ub, "sma50"))
     add("30y yield < its 50-day", None if tyx is None else _last(tyx, "Close") < _last(tyx, "sma50"))
     return items
 
@@ -387,7 +385,7 @@ def stack_tier(items: list[dict], tlt: pd.DataFrame | None) -> tuple[int, str]:
 
 def divergences(frames: dict) -> list[str]:
     notes = []
-    tlt, tyx, zb = frames.get("TLT"), frames.get("TYX"), frames.get("ZB")
+    tlt, tyx, ub = frames.get("TLT"), frames.get("TYX"), frames.get("UB")
     if tlt is not None:
         lows = pivot_points(tlt["Low"], w=4, kind="low")
         if len(lows) >= 2:
@@ -400,11 +398,11 @@ def divergences(frames: dict) -> list[str]:
             d1, d2 = highs.index[-2], highs.index[-1]
             if float(highs.iloc[-1]) > float(highs.iloc[-2]) and float(tyx["rsi14"].loc[d2]) < float(tyx["rsi14"].loc[d1]):
                 notes.append("30y yield exhaustion: higher yield high on weaker RSI (bond bullish)")
-    if tlt is not None and zb is not None:
-        r_tlt, r_zb = _last(tlt, "roc20"), _last(zb, "roc20")
-        if not (np.isnan(r_tlt) or np.isnan(r_zb)) and np.sign(r_tlt) != np.sign(r_zb):
-            leader = "futures leading UP" if r_zb > r_tlt else "futures leading DOWN"
-            notes.append(f"ZB / TLT 20-day momentum disagree ({leader}) — futures usually resolve it")
+    if tlt is not None and ub is not None:
+        r_tlt, r_ub = _last(tlt, "roc20"), _last(ub, "roc20")
+        if not (np.isnan(r_tlt) or np.isnan(r_ub)) and np.sign(r_tlt) != np.sign(r_ub):
+            leader = "futures leading UP" if r_ub > r_tlt else "futures leading DOWN"
+            notes.append(f"UB / TLT 20-day momentum disagree ({leader}) — futures usually resolve it")
     return notes
 
 
@@ -413,7 +411,7 @@ def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
     display / CAUTION material only — no buy/sell booleans, no EXIT rules."""
     d_val, d_live = duration
     tlt, tyx, tnx = frames.get("TLT"), frames.get("TYX"), frames.get("TNX")
-    zb, ub, dba, dbc = frames.get("ZB"), frames.get("UB"), frames.get("DBA"), frames.get("DBC")
+    dba, dbc = frames.get("DBA"), frames.get("DBC")
     out: dict = {"duration": {"D": round(d_val, 2), "live": bool(d_live)}}
     if tyx is not None and len(tyx) >= 2:
         dy_bp = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-2]) * 100
@@ -435,10 +433,6 @@ def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
             out["curve"] = {"spread_bp": round(bp, 0), "chg5_bp": round(d5, 0), "label": label,
                             "bear_steepener": bool(d5 > 3 and y_up5),
                             "bull_flattener": bool(d5 < -3 and not y_up5)}
-    if zb is not None and ub is not None:
-        zb_h = _last(zb, "Close") > _last(zb, "ema21")
-        ub_h = _last(ub, "Close") > _last(ub, "ema21")
-        out["ub"] = {"zb_holds_21ema": bool(zb_h), "ub_holds_21ema": bool(ub_h), "split": bool(zb_h != ub_h)}
     if dba is not None and not np.isnan(_last(dba, "roc20")):
         out["ags_roc20"] = round(_last(dba, "roc20"), 1)
     if dbc is not None and not np.isnan(_last(dbc, "roc20")):
@@ -467,12 +461,6 @@ def macro_checks(frames: dict, aux: dict) -> list[str]:
         elif c["bull_flattener"]:
             line += " | bull flattener, better for TLT"
         notes.append(line)
-    u = aux.get("ub")
-    if u is not None:
-        zb_txt = "holds" if u["zb_holds_21ema"] else "lost"
-        ub_txt = "holds" if u["ub_holds_21ema"] else "lost"
-        state = "SPLIT — UB is the closer proxy for TLT's 20+y book" if u["split"] else "aligned"
-        notes.append(f"UB confirm: ZB {zb_txt} its 21-EMA, UB {ub_txt} its 21-EMA — {state}")
     dba_r, dbc_r = aux.get("ags_roc20"), aux.get("broad_roc20")
     if dba_r is not None:
         if dba_r > 4:
@@ -531,14 +519,14 @@ def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: 
         levels["shares_for_risk"] = int(risk_amt // risk_per_share)
         levels["risk_amount"] = round(risk_amt, 2)
 
-    zb, tyx = frames.get("ZB"), frames.get("TYX")
+    ub, tyx = frames.get("UB"), frames.get("TYX")
     flips = []
     if pd.notna(s50) and close < s50:
         flips.append(f"TLT closes over {s50:.2f} (50-day) — first trend-turn add")
     if pd.notna(s200) and close < s200:
         flips.append(f"TLT closes over {s200:.2f} (200-day) — regime flip")
-    if zb is not None and _last(zb, "Close") < _last(zb, "sma50"):
-        flips.append(f"ZB closes over {to_32nds(_last(zb, 'sma50'))} (50-day) — futures confirm")
+    if ub is not None and _last(ub, "Close") < _last(ub, "sma50"):
+        flips.append(f"UB closes over {to_32nds(_last(ub, 'sma50'))} (50-day) — futures confirm")
     if tyx is not None and _last(tyx, "Close") > _last(tyx, "sma50"):
         flips.append(f"30y yield closes under {_last(tyx, 'sma50'):.2f}% — yield trend cracks")
     flips.append(f"TLT closes under {swing_low:.2f} (15-day low) — bounce dead, bear leg resumes")
@@ -551,7 +539,7 @@ def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict
     low is the structure stop in every mode. Risk-management heuristics that
     bound losses — not a validated edge."""
     tlt = frames["TLT"]
-    zb, tyx = frames.get("ZB"), frames.get("TYX")
+    ub, tyx = frames.get("UB"), frames.get("TYX")
     close = _last(tlt, "Close")
     e21, s50 = _last(tlt, "ema21"), _last(tlt, "sma50")
     rsi_now = _last(tlt, "rsi14")
@@ -577,8 +565,8 @@ def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict
               and float(tlt["High"].iloc[-1]) >= s50 and close <= s50)
     add("trim", f"Tagged the 50-day target ({fmt(s50)}) and rejected — sell into the band", tagged)
     add("trim", f"RSI {rsi_now:.0f} ≥ 70 — overbought, sell-into-strength zone", rsi_now >= 70)
-    add("warn", "ZB futures closed under their 21-EMA — futures lead, cash follows",
-        zb is not None and _last(zb, "Close") < _last(zb, "ema21"))
+    add("warn", "UB futures closed under their 21-EMA — futures lead, cash follows",
+        ub is not None and _last(ub, "Close") < _last(ub, "ema21"))
     add("warn", "30y yield momentum turning back up (9-EMA > 21-EMA on ^TYX)",
         tyx is not None and _last(tyx, "ema9") > _last(tyx, "ema21"))
     bear_div = False
@@ -588,8 +576,6 @@ def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict
         bear_div = (float(highs.iloc[-1]) > float(highs.iloc[-2])
                     and float(tlt["rsi14"].loc[d2]) < float(tlt["rsi14"].loc[d1]))
     add("warn", "Bearish divergence: higher TLT high on weaker RSI — rally exhausting", bear_div)
-    add("warn", "ZB/UB split on the 21-EMA — long-end signal disagreement (UB tracks TLT's book closer)",
-        aux.get("ub", {}).get("split", False))
     add("warn", "Bear-steepening curve while the bounce is on — this tape kills rallies early",
         aux.get("curve", {}).get("bear_steepener", False) and res["bounce"]["active"])
     dba_r, dbc_r = aux.get("ags_roc20"), aux.get("broad_roc20")
@@ -709,8 +695,8 @@ def daily_state(frames: dict) -> pd.DataFrame:
                 state.loc[d] = bool(cur > prev)
         hsl = state.ffill().shift(w).fillna(False).astype(bool)
     conds["c5"] = hsl
-    conds["c6"] = (aligned("ZB", "ema9") > aligned("ZB", "ema21")) & (aligned("ZB", "macd") > aligned("ZB", "macd_sig"))
-    conds["c7"] = aligned("ZB", "Close") > aligned("ZB", "sma50")
+    conds["c6"] = (aligned("UB", "ema9") > aligned("UB", "ema21")) & (aligned("UB", "macd") > aligned("UB", "macd_sig"))
+    conds["c7"] = aligned("UB", "Close") > aligned("UB", "sma50")
     conds["c8"] = aligned("TYX", "Close") < aligned("TYX", "sma50")
     st["stack"] = conds.fillna(False).astype(int).sum(axis=1)
     flip = (st["stack"] >= 5) & (tlt["Close"] > tlt["sma200"])
@@ -718,7 +704,7 @@ def daily_state(frames: dict) -> pd.DataFrame:
                            ["FLIP", "CONFIRMED", "SCOUT"], default="NONE")
 
     score = pd.Series(0.0, index=idx)
-    for key, invert in (("TLT", False), ("ZB", False), ("TYX", True)):
+    for key, invert in (("TLT", False), ("UB", False), ("TYX", True)):
         c, s50, s200 = aligned(key, "Close"), aligned(key, "sma50"), aligned(key, "sma200")
         for cond, wgt in ((c > s200, 2), (c > s50, 1), (s50 > s50.shift(10), 1), (s50 > s200, 1)):
             bullish = ~cond if invert else cond
@@ -736,13 +722,13 @@ def daily_state(frames: dict) -> pd.DataFrame:
     st["exit_50"] = tlt["Close"] < tlt["sma50"]
     # allocator gate components (same thresholds as stack conditions c3/c7/c8)
     st["tlt_gt50"] = conds["c3"].fillna(False)
-    st["zb_gt50"] = conds["c7"].fillna(False)
+    st["ub_gt50"] = conds["c7"].fillna(False)
     st["tyx_lt50"] = conds["c8"].fillna(False)
-    st["alloc_gate"] = st["tlt_gt50"] & st["zb_gt50"] & st["tyx_lt50"]
+    st["alloc_gate"] = st["tlt_gt50"] & st["ub_gt50"] & st["tyx_lt50"]
     rental = st["tier"].isin(["NONE", "SCOUT"]) & (st["regime"] < -33)
     tag_reject = rental & (tlt["High"] >= tlt["sma50"]) & (tlt["Close"] <= tlt["sma50"])
     st["trim_flag"] = tag_reject | (tlt["rsi14"] >= 70)
-    st["ready"] = (tlt["sma200"].notna() & aligned("ZB", "sma200").notna()
+    st["ready"] = (tlt["sma200"].notna() & aligned("UB", "sma200").notna()
                    & aligned("TYX", "sma200").notna() & st["prior_low"].notna())
     return st
 
@@ -773,7 +759,7 @@ VARIANTS = {
     1: "current engine",
     2: "no SCOUT/bounce entries",
     3: "no SCOUT/bounce + structure/50d exits",
-    4: "allocator gate (TYX<50d & ZB>50d & TLT>50d)",
+    4: "allocator gate (TYX<50d & UB>50d & TLT>50d)",
 }
 
 
@@ -783,7 +769,7 @@ def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str |
     at 1/3-2/3-1.0, bounce rentals 1/3, TRIM x0.5 once, trail+structure exits);
     2 = opens only at CONFIRMED/FLIP, no bounce; 3 = variant 2 with the 21-EMA
     trail replaced by structure/50-day exits; 4 = the experimental allocator
-    (binary 1.0/0: enter on TYX<50d & ZB>50d & TLT>50d, exit on close < prior
+    (binary 1.0/0: enter on TYX<50d & UB>50d & TLT>50d, exit on close < prior
     15-day low or < 50-day, no trims, no tiers)."""
     st = daily_state(frames)
     st = st[st["ready"]].copy()
@@ -984,15 +970,15 @@ def allocator_snapshot(frames: dict) -> dict:
     last = st[st["ready"]].iloc[-1]
     eps = bt.get("episodes", [])
     open_ep = eps[-1] if eps and "exit_date" not in eps[-1] else None
-    tlt, zb, tyx = frames["TLT"], frames.get("ZB"), frames.get("TYX")
+    tlt, ub, tyx = frames["TLT"], frames.get("UB"), frames.get("TYX")
     snap = {
         "position": "LONG 1.0" if open_ep is not None else "FLAT",
         "since": str(open_ep["entry_date"].date()) if open_ep is not None else None,
         "entry_px": round(open_ep["entry_px"], 2) if open_ep is not None else None,
         "gate": [
             {"name": f"TLT close > 50-day ({_last(tlt, 'sma50'):.2f})", "on": bool(last["tlt_gt50"])},
-            {"name": "ZB close > 50-day" + (f" ({to_32nds(_last(zb, 'sma50'))})" if zb is not None else " (no data)"),
-             "on": bool(last["zb_gt50"])},
+            {"name": "UB close > 50-day" + (f" ({to_32nds(_last(ub, 'sma50'))})" if ub is not None else " (no data)"),
+             "on": bool(last["ub_gt50"])},
             {"name": "30y yield < 50-day" + (f" ({_last(tyx, 'sma50'):.2f}%)" if tyx is not None else " (no data)"),
              "on": bool(last["tyx_lt50"])},
         ],
@@ -1061,9 +1047,9 @@ def render_plain(res: dict, demo: bool) -> None:
     hdr = f"  {'':5} {'last':>9} {'chg%':>7} {'RSI':>6} {'50d':>9} {'200d':>9} {'MACD':>6} {'20d%':>7}"
     print(DIM + hdr + END)
     for name, t in res["tape"].items():
-        last = to_32nds(t["close"]) if name == "ZB" else f"{t['close']:.2f}"
-        s50 = to_32nds(t["sma50"]) if name == "ZB" and t["sma50"] else (f"{t['sma50']:.2f}" if t["sma50"] else "—")
-        s200 = to_32nds(t["sma200"]) if name == "ZB" and t["sma200"] else (f"{t['sma200']:.2f}" if t["sma200"] else "—")
+        last = to_32nds(t["close"]) if name == "UB" else f"{t['close']:.2f}"
+        s50 = to_32nds(t["sma50"]) if name == "UB" and t["sma50"] else (f"{t['sma50']:.2f}" if t["sma50"] else "—")
+        s200 = to_32nds(t["sma200"]) if name == "UB" and t["sma200"] else (f"{t['sma200']:.2f}" if t["sma200"] else "—")
         chg = f"{t['chg1']:+.2f}"
         chg = (GREEN if t["chg1"] >= 0 else RED) + f"{chg:>7}" + END
         macd_s = paint(t["macd_up"], "up", "down")
@@ -1150,7 +1136,7 @@ def render_rich(res: dict, demo: bool) -> None:
                          ("50d", "right"), ("200d", "right"), ("MACD", "center"), ("20d %", "right")):
         tape.add_column(col, justify=justify)
     for name, t in res["tape"].items():
-        fmt = to_32nds if name == "ZB" else (lambda x: f"{x:.2f}")
+        fmt = to_32nds if name == "UB" else (lambda x: f"{x:.2f}")
         tape.add_row(
             Text(name, style="bold"),
             fmt(t["close"]),
@@ -1280,27 +1266,26 @@ What TLT is: packaged long-duration risk. First-order estimate:
   residual -- a cross-check only, never a buy/sell boolean or veto.
 
 Why three instruments (one market, three quotes):
-  Cash 30y yields, ZB futures, and TLT are three quotes of the same long-end
+  Cash 30y yields, UB futures, and TLT are three quotes of the same long-end
   market, co-moving in overlapping hours -- not a strict causal chain. The
-  operational edge is HOURS: ZB trades the Globex session (Sun 5pm CT - Fri
+  operational edge is HOURS: UB trades the Globex session (Sun 5pm CT - Fri
   4pm CT, 1h daily halt), so it discovers price while TLT is closed and TLT
   often gaps at the cash open. Leadership is information timing, not a
   separate economic cause.
   ^TYX (30y yield)  - the cleanest single series to test trend and
                       exhaustion on; the driver of TLT's value.
-  ZB futures        - the leading tape by hours, NOT a 1:1 TLT clone: the
-                      classic deliverable basket is 15-25y remaining
-                      maturity vs TLT's 20+y cash basket; basis, cheapest-
+  UB futures        - Ultra T-Bond, 25y+ deliverable: the closest listed
+                      futures to TLT's 20+y cash basket, and the only
+                      futures leg. Still not a 1:1 clone -- basis, cheapest-
                       to-deliver, and conversion factors keep them close,
-                      not identical. Ultra Bond (UB) is the tighter duration
-                      proxy if we ever swap; ZB earns its slot on liquidity
-                      and the 23h session.
+                      not identical -- but it is the tightest available
+                      proxy, and it leads TLT by hours.
   TLT               - what you can actually buy; where entries/stops live.
+  A missing UB feed degrades the scan exactly like a missing ^TYX: the
+  affected conditions read n/a and no substitute is invented.
 
-Not on the watchlist, fetched quietly as derived inputs (any may be missing
-  and the scan still runs; none has a buy/sell boolean or an EXIT rule):
-  UB (Ultra Bond futures) - the tighter proxy for TLT's 20+y book, used only
-    as a confirmation line; a ZB/UB split on their 21-EMAs is CAUTION fuel.
+Not on the watchlist, fetched quietly as derived inputs (either may be missing
+  and the scan still runs; neither has a buy/sell boolean or an EXIT rule):
   ^TNX (10y yield) - only to print the 10s30s one-liner. There is no curve
     trade: bear steepeners (yields up, 10s30s wider) are the worse tape for
     TLT, bull flatteners (yields down, tighter) the better one, and the one
@@ -1311,7 +1296,7 @@ Not on the watchlist, fetched quietly as derived inputs (any may be missing
 
 Layer 1 - REGIME (should you even be hunting longs?)
   Moving-average structure (price vs 50d/200d, 50d slope, 50d vs 200d) scored
-  across TLT + ZB, with the same tests INVERTED on ^TYX. Score -100..+100.
+  across TLT + UB, with the same tests INVERTED on ^TYX. Score -100..+100.
   In a BEARISH regime, longs are countertrend RENTALS. In TRANSITION you scout.
   In BULLISH you hold and add. The regime decides SIZE and HOLDING PERIOD,
   not entries.
@@ -1324,7 +1309,7 @@ Layer 2 - TRIGGERS (when do you actually buy?)
   Since the 2026-08 backtest verdict the bounce prints as a TAPE SIGNAL
   only -- it is never presented as a new entry.
   TREND-TURN STACK (8 conditions): 9/21-EMA cross, MACD cross, 50-day reclaim,
-  50-day slope up, higher swing low, ZB momentum cross, ZB 50-day reclaim,
+  50-day slope up, higher swing low, UB momentum cross, UB 50-day reclaim,
   30y yield losing its 50-day. Bottoms are processes: each condition is one
   brick. 3/8 = scout with 1/3 size, 5/8 = confirmed, over the 200-day = regime
   flip, full position. You never need to predict the low - you pay a slightly
@@ -1346,7 +1331,7 @@ Layer 4 - EXITS (the sell signal, evaluated "as if long"):
             the structure stop that overrides everything else.
   TRIM    - tagged the 50-day band from below and got rejected in a bear
             regime, or RSI >= 70: sell strength, don't admire it.
-  CAUTION - two or more early warnings: ZB futures lose their 21-EMA first
+  CAUTION - two or more early warnings: UB futures lose their 21-EMA first
             (futures lead down too), 30y-yield momentum turns back up
             (9>21 EMA on ^TYX), bearish RSI divergence on the highs.
   Exits are mode-aware on purpose: a bear-regime rental dies at the first
@@ -1379,7 +1364,7 @@ BACKTEST VERDICT (2024-06-12 -> 2026-08-26, real data, rules as coded):
 
 THE ALLOCATOR (--allocate) -- EXPERIMENTAL:
   The tape is the product; the allocator is an experiment layered on top.
-  New longs require ALL THREE, else flat: 30y yield < its 50-day, ZB > its
+  New longs require ALL THREE, else flat: 30y yield < its 50-day, UB > its
   50-day, TLT > its 50-day. Size is binary 1.0 or 0 -- no SCOUT opens, no
   bounce opens, no trims. Exits: close < prior 15-day low OR close < the
   50-day (the 21-EMA is NOT an allocator exit). Same thresholds as the
