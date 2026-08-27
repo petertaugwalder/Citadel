@@ -593,7 +593,7 @@ SCHD_EXIT_MODES = {
 
 
 def backtest_schd(frames: dict, cost_bps: float = 1.0, start: str | None = None,
-                  entries: str = "all", exit_mode: str = "trend") -> dict:
+                  entries: str = "all", exit_mode: str = "trend", end: str | None = None) -> dict:
     """Replay the SCHD rules on the ETF path: signals on close T, fills at open T+1.
     entries: 'all' (pullback + breakout) or 'breakout'. exit_mode: see SCHD_EXIT_MODES.
     This is ETF-path timing for a call buyer, NOT marked-to-market call P&L."""
@@ -603,6 +603,8 @@ def backtest_schd(frames: dict, cost_bps: float = 1.0, start: str | None = None,
     st = st[st["ready"]]
     if start:
         st = st[st.index >= pd.Timestamp(start)]
+    if end:
+        st = st[st.index <= pd.Timestamp(end)]
     if len(st) < 60:
         return {"error": f"only {len(st)} tradeable SCHD sessions after warmup/start filter"}
     opens, closes = st["Open"].astype(float), st["Close"].astype(float)
@@ -1257,7 +1259,8 @@ VARIANTS = {
 }
 
 
-def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str | None = None) -> dict:
+def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str | None = None,
+             end: str | None = None) -> dict:
     """Bar-by-bar replay. Signals form on close T, fills at open T+1, costs per
     side on weight changes. Variants (ablation): 1 = current engine (tier opens
     at 1/3-2/3-1.0, bounce rentals 1/3, TRIM x0.5 once, trail+structure exits);
@@ -1269,6 +1272,8 @@ def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str |
     st = st[st["ready"]].copy()
     if start:
         st = st[st.index >= pd.Timestamp(start)]
+    if end:
+        st = st[st.index <= pd.Timestamp(end)]
     if len(st) < 60:
         return {"error": f"only {len(st)} tradeable sessions after warmup/start filter"}
     opens, closes = st["Open"].astype(float), st["Close"].astype(float)
@@ -1481,6 +1486,84 @@ def allocator_snapshot(frames: dict) -> dict:
         "exit_levels": f"close < {float(last['prior_low']):.2f} (prior 15-day low) or < {_last(tlt, 'sma50'):.2f} (50-day)",
     }
     return snap
+
+
+def run_stress(frames: dict, blocks: int = 4, costs=(1.0, 5.0, 10.0),
+               schd: bool = False, exit_mode: str = "trend", variant: int = 1) -> dict:
+    """The sensitivity discipline the SCHD call test used, applied to the ETF engines:
+    split the history into contiguous sub-periods, re-run at several cost levels, and
+    report whether the vs-buy-and-hold edge survives every leg or straddles zero."""
+    runner = ((lambda **kw: backtest_schd(frames, exit_mode=exit_mode, **kw)) if schd
+              else (lambda **kw: backtest(frames, variant=variant, **kw)))
+    full = runner(cost_bps=costs[0])
+    if "error" in full:
+        return full
+    st = daily_state(frames) if not schd else schd_state(frames)
+    idx = st[st["ready"]].index
+    edges = [idx[int(len(idx) * i / blocks)] for i in range(blocks)] + [idx[-1]]
+
+    rows = []
+    for cost in costs:
+        for b in range(blocks):
+            lo, hi = edges[b], edges[b + 1]
+            r = runner(cost_bps=cost, start=str(lo.date()), end=str(hi.date()))
+            if "error" in r:
+                continue
+            sm = r["summary"]
+            bh = sm.get("buy_and_hold_tlt") or sm["buy_and_hold_schd"]
+            rows.append({"leg": f"P{b + 1} {lo.date()}..{hi.date()}", "cost_bps": cost,
+                         "trades": sm["trades"]["closed"], "total_pct": sm["strategy"]["total_return_pct"],
+                         "bh_pct": bh["total_return_pct"],
+                         "vs_bh": round(sm["strategy"]["total_return_pct"] - bh["total_return_pct"], 2),
+                         "max_dd": sm["strategy"]["max_drawdown_pct"], "bh_dd": bh["max_drawdown_pct"],
+                         "pf": sm["trades"]["profit_factor"]})
+        r = runner(cost_bps=cost)
+        sm = r["summary"]
+        bh = sm.get("buy_and_hold_tlt") or sm["buy_and_hold_schd"]
+        rows.append({"leg": "FULL", "cost_bps": cost, "trades": sm["trades"]["closed"],
+                     "total_pct": sm["strategy"]["total_return_pct"], "bh_pct": bh["total_return_pct"],
+                     "vs_bh": round(sm["strategy"]["total_return_pct"] - bh["total_return_pct"], 2),
+                     "max_dd": sm["strategy"]["max_drawdown_pct"], "bh_dd": bh["max_drawdown_pct"],
+                     "pf": sm["trades"]["profit_factor"]})
+
+    vs = [r["vs_bh"] for r in rows]
+    dd_better = sum(1 for r in rows if r["max_dd"] > r["bh_dd"])
+    return {"instrument": "SCHD" if schd else "TLT",
+            "mode": exit_mode if schd else f"variant {variant}",
+            "window": full["summary"]["window"], "blocks": blocks, "costs": list(costs), "rows": rows,
+            "summary": {"vs_bh_min": min(vs), "vs_bh_max": max(vs),
+                        "legs_positive": sum(1 for v in vs if v > 0), "legs": len(vs),
+                        "straddles_zero": min(vs) < 0 < max(vs),
+                        "legs_dd_better": dd_better}}
+
+
+def render_stress(res: dict) -> None:
+    if "error" in res:
+        print(f"stress: {res['error']}", file=sys.stderr)
+        return
+    sm = res["summary"]
+    print(f"\n{BOLD}{res['instrument']} STRESS TEST{END}  {res['window']}  ({res['mode']}, "
+          f"{res['blocks']} sub-periods x {len(res['costs'])} cost levels)")
+    print("=" * 96)
+    print(DIM + f"  {'leg':<26} {'bps':>4} {'trades':>6} {'total%':>9} {'B&H%':>9} "
+                f"{'vsB&H':>9} {'maxDD%':>8} {'B&H DD':>8} {'PF':>6}" + END)
+    for r in res["rows"]:
+        col = GREEN if r["vs_bh"] > 0 else RED
+        pf = f"{r['pf']:.2f}" if r["pf"] is not None else "—"
+        bold = BOLD if r["leg"] == "FULL" else ""
+        print(f"  {bold}{r['leg']:<26}{END} {r['cost_bps']:>4.1f} {r['trades']:>6} "
+              f"{r['total_pct']:>+9.2f} {r['bh_pct']:>+9.2f} {col}{r['vs_bh']:>+9.2f}{END} "
+              f"{r['max_dd']:>8.2f} {r['bh_dd']:>8.2f} {pf:>6}")
+    verdict = ("NO ROBUST EDGE — the vs-B&H result straddles zero across legs"
+               if sm["straddles_zero"] else
+               "consistently BEHIND buy-and-hold on every leg" if sm["vs_bh_max"] <= 0 else
+               "ahead on every leg — treat with suspicion, this is in-sample")
+    print(f"\n  {BOLD}vs-B&H range {sm['vs_bh_min']:+.2f} .. {sm['vs_bh_max']:+.2f} pts"
+          f"   ({sm['legs_positive']}/{sm['legs']} legs positive){END}")
+    print(f"  drawdown better than B&H on {sm['legs_dd_better']}/{sm['legs']} legs")
+    print(f"  {BOLD}VERDICT: {verdict}{END}")
+    print(f"\n  {DIM}Same discipline as the SCHD call test: a result that only survives one leg is a"
+          f"\n  parameter choice, not an edge. All legs are in-sample.{END}\n")
 
 
 def render_backtest(res: dict) -> None:
@@ -2003,6 +2086,9 @@ def main() -> int:
     ap.add_argument("--cost-bps", type=float, default=1.0, help="backtest cost per side in bps (default 1.0)")
     ap.add_argument("--allocate", action="store_true",
                     help="experimental allocator: dashboard panel (gate + position), or variant 4 with --backtest")
+    ap.add_argument("--stress", action="store_true",
+                    help="sensitivity test: sub-periods x cost levels; does the edge survive every leg?")
+    ap.add_argument("--blocks", type=int, default=4, help="sub-periods for --stress (default 4)")
     ap.add_argument("--ablate", action="store_true",
                     help="run the 4-variant ablation (current / no-SCOUT / no-trail / allocator) at 1bp and 5bp")
     ap.add_argument("--from", dest="from_date", metavar="YYYY-MM-DD",
@@ -2021,7 +2107,11 @@ def main() -> int:
             return 1
         if args.demo and not args.json:
             print(f"\n{YEL}{BOLD}[DEMO DATA — synthetic tape, results validate the pipeline, not the strategy]{END}")
-        if args.schd and args.schd_exit is None:
+        if args.stress:
+            res = run_stress(frames, blocks=args.blocks, schd=args.schd,
+                             exit_mode=args.schd_exit or "trend")
+            print(json.dumps(res, indent=2, default=str)) if args.json else render_stress(res)
+        elif args.schd and args.schd_exit is None:
             res = run_schd_modes(frames, cost_bps=args.cost_bps, start=args.from_date)
             print(json.dumps(res, indent=2, default=str)) if args.json else render_schd_modes(res)
         elif args.schd:

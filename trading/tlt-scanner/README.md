@@ -207,6 +207,25 @@ spread cost against the measured 8.71% median, and carries the no-edge notice.
 The 55-day breakout is *not* adopted here — picking the best of 96 variants on
 17 closed campaigns is parameter search, and its own sensitivity range says so.
 
+### Stress testing either engine (`--stress`)
+
+The SCHD call verdict turned on a sensitivity range, not a headline number.
+`--stress` applies the same discipline to the ETF engines: it splits the
+history into contiguous sub-periods, re-runs at 1 / 5 / 10 bps per side, and
+reports whether the vs-buy-and-hold result survives **every** leg or straddles
+zero.
+
+```bash
+python tlt_scanner.py --backtest --stress                 # TLT
+python tlt_scanner.py --backtest --stress --schd          # SCHD (trend mode)
+python tlt_scanner.py --backtest --stress --blocks 6      # finer sub-periods
+```
+
+It prints per-leg trades, return, B&H, vs-B&H, both drawdowns and PF, then a
+range line, a count of legs beating B&H, a count of legs with better drawdown,
+and a verdict. A result that survives one leg is a parameter choice, not an
+edge — and every leg is still in-sample.
+
 **Read all of the above as descriptive, not predictive** — the rules were
 written after seeing these tapes.
 
