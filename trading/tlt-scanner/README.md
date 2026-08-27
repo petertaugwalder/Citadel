@@ -4,10 +4,10 @@ Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 **UB futures** (Ultra T-Bond) and the **30y yield (^TYX)** as confirming tape.
 TLT is the only trade vehicle. **The tape is the product; `--allocate` is an
 experimental allocator layered on top** (binary gate, details below).
-Shown on the tape: **TLT / UB / ^TYX / DBA**.
-Fetched quietly as derived inputs, never shown as rows and never required:
-**^TNX** (10s30s display one-liner) and **DBC** (broad-commodity co-flag),
-plus TLT's live effective duration.
+Shown on the tape: **TLT / UB / ^TYX** (the duration triangle) plus **SCHD**,
+a display-only equity-income sleeve that votes on nothing. Fetched quietly as
+a derived input, never shown as a row and never required: **^TNX** (10s30s
+display one-liner), plus TLT's live effective duration.
 Daily (end-of-day) data from Yahoo Finance, cached locally. Built for iTerm —
 rich TUI dashboard with a plain-ANSI fallback.
 
@@ -72,17 +72,19 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
   exchange for better odds.
 
 **Layer 3 — CROSS-CHECKS**: TLT bullish RSI divergence, ^TYX yield-exhaustion
-divergence, UB/TLT momentum disagreement (UB leads by hours), and the DBA
-commodity tape as a **coarse secondary inflation flag** — DBA is agriculture
-futures, not CPI; food is one slice of bond-relevant inflation, and a DBA
-spike can be weather or cocoa saying nothing about 30y term premium.
+divergence, and UB/TLT momentum disagreement (UB leads by hours).
 The aux inputs add display lines here: live duration (`D≈…` with the
 first-order Δy mapping, STALE-marked 15.0 fallback), a 5-session
-actual-vs-duration-implied residual (cross-check only), the 10s30s
-STEEPENING/FLATTENING one-liner, and `| broad (DBC)` appended to the
-inflation line. Two of these can each add one CAUTION-class warning
-(bear-steepening during an active bounce; DBA and DBC hot together) —
-never an EXIT, never a buy/sell boolean.
+actual-vs-duration-implied residual (cross-check only), and the 10s30s
+STEEPENING/FLATTENING one-liner. Only bear-steepening during an active
+bounce adds a CAUTION-class warning — never an EXIT, never a buy/sell
+boolean.
+
+**SCHD sleeve — display only.** SCHD gets a tape row and its own `SCHD tape`
+panel (position vs its own 50/200-day, and its 20-day % read as stocks bid or
+offered while you trade TLT). It is **not** part of the duration triangle: it
+never votes on regime, stack, bounce, `--allocate`, or any TLT
+EXIT/TRIM/CAUTION, carries no size or stop, and never fires a notification.
 
 **Layer 4 — EXIT ENGINE** (the sell signal, evaluated "as if long"):
 **EXIT** on a close under the trail (21-EMA for rentals/swings, 50-day after a
@@ -158,3 +160,4 @@ and 5bp on the same window; every variant is in-sample.
 ## Changelog
 
 - ZB removed, UB only.
+- DBA and DBC removed; SCHD added display-only.

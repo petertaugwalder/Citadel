@@ -11,12 +11,11 @@ Three-layer model:
                   * TREND-TURN STACK — 8 confirmation conditions across TLT / UB / ^TYX that
                               light up as a downtrend actually reverses. Tiers: SCOUT >= 3,
                               CONFIRMED >= 5, REGIME FLIP = close over the 200-day.
-  3. CROSS-CHECKS — futures/cash divergence, yield-exhaustion divergence, and the
-                commodity (DBA) tape as a coarse secondary inflation flag (ag
-                futures, not CPI). Quietly-fetched aux inputs — ^TNX and DBC — feed
-                display lines (live duration, 10s30s one-liner, broad inflation
-                co-flag) and CAUTION-class warnings only; neither is required
-                for a scan and neither is a watchlist row.
+  3. CROSS-CHECKS — futures/cash divergence and yield-exhaustion divergence.
+                ^TNX is fetched quietly for the 10s30s one-liner only; it is not
+                required for a scan and is not a watchlist row. SCHD rides along
+                as a DISPLAY-ONLY equity-income sleeve: it never votes on regime,
+                stack, bounce, --allocate, or any TLT EXIT/TRIM/CAUTION.
   4. EXIT ENGINE — the sell signal, evaluated "as if long": trail breaks (21-EMA for
                 rentals/swings, 50-day once the regime flipped), a hard structure stop
                 (close under the prior 15-day low), trim-into-strength triggers, and
@@ -57,12 +56,11 @@ TICKERS = {  # the watchlist — the only rows shown on the tape
     "TLT": "TLT",     # trade vehicle: 20+yr Treasury ETF — the only thing traded
     "UB": "UB=F",     # Ultra Bond futures: primary futures tape (25y+ basket, tightest match to TLT's book)
     "TYX": "^TYX",    # 30y yield index (drives TLT, inverted)
-    "DBA": "DBA",     # ag futures: coarse secondary inflation flag (not CPI)
+    "SCHD": "SCHD",   # equity-income ETF: display-only sleeve, never votes on any TLT signal
 }
 AUX_TICKERS = {  # fetched quietly as derived inputs — never shown as watchlist rows,
                  # never required: a scan runs fine with any or all of these missing
     "TNX": "^TNX",   # 10y yield: private input for the 10s30s display one-liner (no curve trade)
-    "DBC": "DBC",    # broad commodity basket: informational co-flag for the DBA ag tape
 }
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
@@ -225,10 +223,9 @@ def demo_frames() -> dict[str, pd.DataFrame]:
     shapes = {
         "TLT": (102.0, [(0.55, -0.13), (0.25, -0.05), (0.17, -0.055), (0.03, 0.028)], 0.0055),
         "TYX": (4.10, [(0.55, 0.16), (0.25, 0.05), (0.17, 0.055), (0.03, -0.021)], 0.0065),
-        "DBA": (26.0, [(0.70, 0.02), (0.15, -0.03), (0.15, 0.105)], 0.0060),
         "UB": (135.0, [(0.55, -0.12), (0.25, -0.05), (0.17, -0.05), (0.03, 0.015)], 0.0050),
         "TNX": (3.90, [(0.55, 0.13), (0.25, 0.03), (0.17, 0.032), (0.03, -0.012)], 0.0060),
-        "DBC": (22.0, [(0.85, 0.01), (0.09, -0.03), (0.06, 0.10)], 0.0055),
+        "SCHD": (26.0, [(0.55, 0.06), (0.25, -0.04), (0.20, 0.09)], 0.0070),
     }
     return {k: enrich(_demo_walk(rng, n, s, seg, v)) for k, (s, seg, v) in shapes.items()}
 
@@ -411,7 +408,7 @@ def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
     display / CAUTION material only — no buy/sell booleans, no EXIT rules."""
     d_val, d_live = duration
     tlt, tyx, tnx = frames.get("TLT"), frames.get("TYX"), frames.get("TNX")
-    dba, dbc = frames.get("DBA"), frames.get("DBC")
+    schd = frames.get("SCHD")
     out: dict = {"duration": {"D": round(d_val, 2), "live": bool(d_live)}}
     if tyx is not None and len(tyx) >= 2:
         dy_bp = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-2]) * 100
@@ -433,10 +430,19 @@ def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
             out["curve"] = {"spread_bp": round(bp, 0), "chg5_bp": round(d5, 0), "label": label,
                             "bear_steepener": bool(d5 > 3 and y_up5),
                             "bull_flattener": bool(d5 < -3 and not y_up5)}
-    if dba is not None and not np.isnan(_last(dba, "roc20")):
-        out["ags_roc20"] = round(_last(dba, "roc20"), 1)
-    if dbc is not None and not np.isnan(_last(dbc, "roc20")):
-        out["broad_roc20"] = round(_last(dbc, "roc20"), 1)
+    if schd is not None:
+        c, s50, s200 = _last(schd, "Close"), _last(schd, "sma50"), _last(schd, "sma200")
+        if pd.notna(s50) and pd.notna(s200):
+            stance = ("above both" if c > s50 and c > s200
+                      else "below both" if c < s50 and c < s200 else "mixed")
+        else:
+            stance = "n/a"
+        out["schd"] = {
+            "close": round(c, 2), "stance": stance,
+            "sma50": round(s50, 2) if pd.notna(s50) else None,
+            "sma200": round(s200, 2) if pd.notna(s200) else None,
+            "roc20": round(_last(schd, "roc20"), 1) if not np.isnan(_last(schd, "roc20")) else None,
+        }
     return out
 
 
@@ -461,18 +467,20 @@ def macro_checks(frames: dict, aux: dict) -> list[str]:
         elif c["bull_flattener"]:
             line += " | bull flattener, better for TLT"
         notes.append(line)
-    dba_r, dbc_r = aux.get("ags_roc20"), aux.get("broad_roc20")
-    if dba_r is not None:
-        if dba_r > 4:
-            line = f"Inflation tape (coarse, ags only): DBA +{dba_r:.1f}%/20d — pressure on yields; cap bounce targets"
-        elif dba_r < -4:
-            line = f"Inflation tape (coarse, ags only): DBA {dba_r:.1f}%/20d — commodity disinflation, a TLT tailwind"
-        else:
-            line = f"Inflation tape (coarse, ags only): DBA {dba_r:+.1f}%/20d — neutral"
-        if dbc_r is not None:
-            line += f" | broad (DBC) {dbc_r:+.1f}%/20d"
-        notes.append(line)
     return notes
+
+
+def schd_lines(aux: dict) -> list[str]:
+    """Two display-only lines for the SCHD panel. Never touches TLT signal state."""
+    sc = aux.get("schd")
+    if sc is None:
+        return ["n/a — no SCHD data"]
+    lines = [f"{sc['close']:.2f} — {sc['stance']} its 50/200-day"
+             + (f" (50d {sc['sma50']:.2f} / 200d {sc['sma200']:.2f})" if sc["sma50"] and sc["sma200"] else "")]
+    if sc["roc20"] is not None:
+        bid = "stocks bid" if sc["roc20"] > 0 else "stocks offered"
+        lines.append(f"{sc['roc20']:+.1f}%/20d — {bid} while you trade TLT")
+    return lines
 
 
 def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: float) -> dict:
@@ -578,9 +586,6 @@ def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict
     add("warn", "Bearish divergence: higher TLT high on weaker RSI — rally exhausting", bear_div)
     add("warn", "Bear-steepening curve while the bounce is on — this tape kills rallies early",
         aux.get("curve", {}).get("bear_steepener", False) and res["bounce"]["active"])
-    dba_r, dbc_r = aux.get("ags_roc20"), aux.get("broad_roc20")
-    add("warn", "Ag AND broad commodities hot (+4%/20d both) — inflation pressure is broad-based",
-        dba_r is not None and dbc_r is not None and dba_r > 4 and dbc_r > 4)
 
     exits = [c for c in conds if c["kind"] == "exit" and c["on"]]
     trims = [c for c in conds if c["kind"] == "trim" and c["on"]]
@@ -1104,6 +1109,9 @@ def render_plain(res: dict, demo: bool) -> None:
         print(f"  position: entry {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt}{note}")
         if pos.get("be_level") is not None and ex["trail"]["level"] is not None:
             print(f"  engine trail stays {ex['trail']['level']:.2f} | ≥ +1R → suggest stop to breakeven {pos['be_level']:.2f}")
+    print(f"\n{BOLD}SCHD TAPE{END}  {DIM}(display only — no size, no stop, votes on nothing){END}")
+    for line in schd_lines(res["aux"]):
+        print(f"  * {line}")
     print(f"\n{BOLD}WHAT FLIPS IT{END}")
     for f in p["what_flips_it"]:
         print(f"  -> {f}")
@@ -1216,6 +1224,11 @@ def render_rich(res: dict, demo: bool) -> None:
     console.print(Panel(Group(plan, Text(), flips), title="plan", border_style="green"))
     console.print(Panel(Group(*ex_group), title="exit engine — as if long TLT",
                         border_style="red" if v.startswith("EXIT") else "green"))
+    schd_t = Text()
+    for line in schd_lines(res["aux"]):
+        schd_t.append(f"{line}\n")
+    schd_t.append("display only — no size, no stop, votes on no TLT signal", style="dim")
+    console.print(Panel(schd_t, title="SCHD tape", border_style="blue"))
     alloc = res.get("allocator")
     if alloc is not None and "error" not in alloc:
         a_t = Table(box=None, pad_edge=False, show_header=False)
@@ -1291,8 +1304,6 @@ Not on the watchlist, fetched quietly as derived inputs (either may be missing
     TLT, bull flatteners (yields down, tighter) the better one, and the one
     coded consequence is a CAUTION-class warning when bear-steepening
     coincides with an active bounce.
-  DBC (broad commodities) - informational co-flag next to the coarse DBA ag
-    tape; only when BOTH run hot does it add one CAUTION-class warning.
 
 Layer 1 - REGIME (should you even be hunting longs?)
   Moving-average structure (price vs 50d/200d, 50d slope, 50d vs 200d) scored
@@ -1319,11 +1330,11 @@ Layer 3 - CROSS-CHECKS (is the signal honest?)
   * Bullish divergence on TLT lows / RSI - sellers exhausting.
   * Yield exhaustion: ^TYX higher high on weaker RSI - the uptrend in yields
     thinning out. Yield-down is the only durable TLT fuel.
-  * DBA / commodity tape: a COARSE secondary inflation flag, nothing more.
-    DBA is agriculture futures, not CPI -- food is one slice, and energy/
-    shelter/services drive most bond-relevant inflation. A DBA spike can be
-    weather or cocoa and say nothing about 30y term premium. A hot ag tape
-    argues for renting bounces rather than marrying them; weigh it lightly.
+  * SCHD sleeve: DISPLAY ONLY. The equity-income tape sits next to the
+    duration triangle -- it is NOT part of it. SCHD never votes on regime,
+    stack, bounce, --allocate, or any TLT EXIT/TRIM/CAUTION, carries no size
+    or stop, and never fires a notification. Read it as context on whether
+    stocks are bid or offered while you trade TLT; nothing more.
 
 Layer 4 - EXITS (the sell signal, evaluated "as if long"):
   EXIT    - close under the trail (21-EMA for rentals and swings, 50-day once
