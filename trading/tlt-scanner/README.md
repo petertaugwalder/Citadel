@@ -85,23 +85,37 @@ STEEPENING/FLATTENING one-liner. Only bear-steepening during an active
 bounce adds a CAUTION-class warning — never an EXIT, never a buy/sell
 boolean.
 
-## The SCHD leg (traded, separate engine)
+## The SCHD leg — a call-timing overlay
 
-SCHD is a quality/dividend equity ETF in a durable uptrend, so it gets
-**trend rules, not TLT's mean-reversion rules** — nothing is shared between
-the two engines, in either direction.
+**I buy SCHD calls, not shares.** This leg is a timing overlay for call
+entries and exits: it prints setups, a hold window, and invalidation levels —
+never a share size. The stock buy-and-hold column is **context, not the
+objective**; beating an ETF you don't own isn't the bar.
 
 - **Trend gate** (all three, else stand aside): close > 200-day, 50-day >
   200-day, 50-day rising.
-- **Entries**: **PULLBACK** — tagged the 20-EMA within 3 sessions and closed
-  back above it; **BREAKOUT** — a new 20-day closing high.
-- **Exits**: close < 50-day reduces; close < 200-day exits. No 21-EMA trail.
-- **Risk**: stop = 20-day swing low − 0.5×ATR; size = (account × risk%) ÷
-  (entry − stop); first target +2R. `--schd-entry 28.50` adds open P&L and
-  R-multiple.
-- **Backtest**: `--backtest --schd`; compare entry/exit families with
-  `--backtest --schd --ablate` (4 variants × 1bp/5bp). The in-sample caveat
-  applies exactly as it does to TLT.
+- **Entries** (unchanged): **PULLBACK** — tagged the 20-EMA within 3 sessions
+  and closed back above it; **BREAKOUT** — a new 20-day closing high.
+- **Exits** — `--schd-exit`, default **`trend`**:
+  | mode | behaviour |
+  |---|---|
+  | `swing` | flatten on close < 50-day or < 200-day — the share-overlay baseline, kept for comparison |
+  | `reduce` | 50-day halves the position (restored on a reclaim); 200-day flattens |
+  | **`trend`** | **default** — flatten only on close < 200-day; the 50-day is a trim/roll warning, not an auto-flatten |
+- **Hold window**: derived from the p25–p75 of winning trades in the active
+  mode's own backtest, so you can pick an expiry that covers it.
+- **`--schd-entry`** is an ETF fill reference for open P&L / R on the
+  underlying path — *not* your call P&L.
+- **Backtest**: `--backtest --schd` prints the swing/reduce/trend comparison
+  (trades, time-in-market, total return, maxDD, avg hold, %holds ≤5d, PF,
+  2–5 session scratches, ≥60 session holds). Naming a mode prints it in
+  detail. This is **ETF-path timing, not marked-to-market call P&L** — a
+  3-day loser costs far more in calls than the stock % shows, and a 90-day
+  winner is only real if the expiry covered it. In-sample caveat applies.
+
+**Not solved:** there are no historical SCHD option marks here, so nothing
+measures actual call P&L. The overlay times the underlying; the option
+outcome depends on strike, expiry, IV and spread at your fill.
 
 ## Buying SCHD calls (`--options`)
 
@@ -197,3 +211,4 @@ and 5bp on the same window; every variant is in-sample.
 - DBA and DBC removed; SCHD added display-only.
 - SCHD promoted to a traded leg with its own trend engine and backtest.
 - SCHD ablation (4 entry/exit variants), price-only benchmark, and a call-buyer options panel.
+- SCHD reframed as a call-timing overlay: --schd-exit swing/reduce/trend (default trend), no share sizing.

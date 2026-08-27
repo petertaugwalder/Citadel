@@ -14,10 +14,10 @@ Three-layer model:
   3. CROSS-CHECKS — futures/cash divergence and yield-exhaustion divergence.
                 ^TNX is fetched quietly for the 10s30s one-liner only; it is not
                 required for a scan and is not a watchlist row.
-  5. SCHD LEG — a second TRADED instrument with its own trend-following engine
-                (gate, entries, stop, targets, exits, backtest). It is scored
-                separately and never votes on any TLT signal, and TLT never
-                votes on it.
+  5. SCHD LEG — a CALL-TIMING OVERLAY on SCHD. The user buys calls, not shares,
+                so the panel prints setups, hold windows and invalidation levels,
+                never a share size. Scored separately: it never votes on any TLT
+                signal, and TLT never votes on it.
   4. EXIT ENGINE — the sell signal, evaluated "as if long": trail breaks (21-EMA for
                 rentals/swings, 50-day once the regime flipped), a hard structure stop
                 (close under the prior 15-day low), trim-into-strength triggers, and
@@ -505,9 +505,23 @@ def schd_state(frames: dict) -> pd.DataFrame:
     return df
 
 
+def schd_hold_window(frames: dict, exit_mode: str = "trend") -> dict | None:
+    """Suggested hold window in sessions, derived from the winning trades of the
+    engine's own backtest in this exit mode — not from a fitted statistic."""
+    bt = backtest_schd(frames, exit_mode=exit_mode)
+    if "error" in bt:
+        return None
+    wins = [e["days"] for e in bt["episodes"] if e.get("pnl_pct", 0) > 0 and "exit_date" in e]
+    if not wins:
+        return None
+    return {"median": int(np.median(wins)), "p25": int(np.percentile(wins, 25)),
+            "p75": int(np.percentile(wins, 75)), "n": len(wins), "mode": exit_mode}
+
+
 def schd_engine(frames: dict, account: float | None = None, risk_pct: float = 1.0,
-                entry: float | None = None) -> dict:
-    """Live SCHD plan: trend gate, trigger, levels, sizing and exit verdict.
+                entry: float | None = None, exit_mode: str = "trend") -> dict:
+    """Live SCHD call-timing plan: trend gate, setup, hold window, invalidation.
+    This is a timing overlay for CALL entries/exits — it never sizes shares.
     Computed only from SCHD's own bars — no TLT/UB/^TYX input, ever."""
     st = schd_state(frames)
     if st.empty or not bool(st["ready"].iloc[-1]):
@@ -522,9 +536,14 @@ def schd_engine(frames: dict, account: float | None = None, risk_pct: float = 1.
     risk_ps = max(c - stop, 0.01)
 
     if bool(r["exit_hard"]):
-        action, why = "EXIT — close under the 200-day", "trend broken"
+        action, why = "EXIT — close under the 200-day", "thesis dead: close the calls"
     elif bool(r["exit_swing"]):
-        action, why = "EXIT/REDUCE — close under the 50-day", "swing trend broken"
+        if exit_mode == "swing":
+            action, why = "EXIT — close under the 50-day", "swing mode: flatten"
+        elif exit_mode == "reduce":
+            action, why = "REDUCE — close under the 50-day", "cut the position in half; 200-day still holds"
+        else:
+            action, why = "TRIM / ROLL WARNING — close under the 50-day", "not an exit in trend mode; 200-day is the flatten line"
     elif bool(r["breakout"]):
         action, why = "BUY — breakout continuation", f"new {SCHD_BREAKOUT_LOOKBACK}-day closing high in an uptrend"
     elif bool(r["pullback"]):
@@ -534,7 +553,10 @@ def schd_engine(frames: dict, account: float | None = None, risk_pct: float = 1.
     else:
         action, why = "STAND ASIDE — trend gate off", "needs close > 200-day with a rising 50 > 200"
 
+    hold = schd_hold_window(frames, exit_mode=exit_mode)
     out = {
+        "exit_mode": exit_mode, "exit_mode_desc": SCHD_EXIT_MODES[exit_mode],
+        "hold_window": hold,
         "close": round(c, 2), "stance": stance, "rsi": round(float(r["rsi14"]), 1),
         "roc20": round(float(r["roc20"]), 1) if pd.notna(r["roc20"]) else None,
         "trend_ok": bool(r["trend_ok"]),
@@ -548,13 +570,13 @@ def schd_engine(frames: dict, account: float | None = None, risk_pct: float = 1.
             "entry": round(c, 2), "stop": round(stop, 2), "risk_per_share": round(risk_ps, 2),
             "ema20": round(e20, 2), "sma50": round(s50, 2), "sma200": round(s200, 2),
             "targets": [round(c + 2 * risk_ps, 2)],
-            "exit_levels": f"close < {s50:.2f} (50-day) reduces, < {s200:.2f} (200-day) exits",
+            "warn_level": round(s50, 2),
+            "invalidation": round(s200, 2),
+            "exit_levels": (f"ETF close < {s50:.2f} (50-day) = "
+                            + ("flatten" if exit_mode == "swing" else "halve" if exit_mode == "reduce" else "trim/roll warning")
+                            + f"; < {s200:.2f} (200-day) = thesis dead, close the calls"),
         },
     }
-    if account:
-        risk_amt = account * risk_pct / 100.0
-        out["levels"]["shares_for_risk"] = int(risk_amt // risk_ps)
-        out["levels"]["risk_amount"] = round(risk_amt, 2)
     if entry:
         out["position"] = {
             "entry": entry, "pnl_pct": round((c - entry) / entry * 100, 2),
@@ -881,25 +903,32 @@ def options_lines(opt: dict) -> list[str]:
 
 
 def schd_lines(engine: dict) -> list[str]:
-    """Panel lines for the SCHD trading leg."""
+    """Panel lines for the SCHD call-timing overlay. Never prints a share size."""
     if "error" in engine:
         return ["n/a — no SCHD data"]
     lv = engine["levels"]
     lines = [
-        f"{engine['action']} — {engine['why']}",
+        f"SETUP: {engine['action']} — {engine['why']}",
         f"{engine['close']:.2f}, {engine['stance']} its 50/200-day  |  RSI {engine['rsi']:.0f}"
         + (f"  |  {engine['roc20']:+.1f}%/20d" if engine["roc20"] is not None else ""),
-        f"20-EMA {lv['ema20']:.2f}   50-day {lv['sma50']:.2f}   200-day {lv['sma200']:.2f}",
-        f"entry ~{lv['entry']:.2f}   stop {lv['stop']:.2f}   risk/share {lv['risk_per_share']:.2f}"
-        + (f"   +2R target {lv['targets'][0]:.2f}" if lv.get("targets") else ""),
+    ]
+    h = engine.get("hold_window")
+    if h:
+        thin = "  [THIN SAMPLE]" if h["n"] < 5 else ""
+        plural = "trade" if h["n"] == 1 else "trades"
+        lines.append(f"suggested hold: {h['p25']}-{h['p75']} sessions (median {h['median']}), "
+                     f"from the {h['n']} winning {plural} in {h['mode']} mode — "
+                     f"pick an expiry that covers it{thin}")
+    lines += [
+        f"levels: 20-EMA {lv['ema20']:.2f}   50-day {lv['sma50']:.2f} (warn)   200-day {lv['sma200']:.2f} (invalidation)",
         f"exit: {lv['exit_levels']}",
     ]
-    if "shares_for_risk" in lv:
-        lines.append(f"size for ${lv['risk_amount']:.0f} risk: {lv['shares_for_risk']} shares")
     if engine.get("position"):
         pos = engine["position"]
-        r_txt = f" ({pos['r_multiple']:+.2f}R)" if pos.get("r_multiple") is not None else ""
-        lines.append(f"position: entry {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt}")
+        r_txt = f" ({pos['r_multiple']:+.2f}R on the ETF)" if pos.get("r_multiple") is not None else ""
+        lines.append(f"ETF reference fill {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt} "
+                     f"— underlying path only, not your call P&L")
+    lines.append("calls only — no share size; expiry must cover the hold window above")
     return lines
 
 
@@ -1052,7 +1081,7 @@ def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict
 
 def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
             entry: float | None = None, duration: tuple[float, bool] = (15.0, False),
-            schd_entry: float | None = None) -> dict:
+            schd_entry: float | None = None, schd_exit: str = "trend") -> dict:
     comps = regime_components(frames)
     score, label = regime_score(comps)
     aux = aux_metrics(frames, duration)
@@ -1084,7 +1113,8 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
         }
     res["plan"] = action_and_levels(frames, res, account, risk_pct)
     res["exit"] = exit_engine(frames, res, entry, aux)
-    res["schd"] = schd_engine(frames, account=account, risk_pct=risk_pct, entry=schd_entry)
+    res["schd"] = schd_engine(frames, account=account, risk_pct=risk_pct, entry=schd_entry,
+                              exit_mode=schd_exit)
     return res
 
 
@@ -1539,7 +1569,8 @@ def render_plain(res: dict, demo: bool) -> None:
             print(f"  engine trail stays {ex['trail']['level']:.2f} | ≥ +1R → suggest stop to breakeven {pos['be_level']:.2f}")
     sc = res["schd"]
     sc_col = GREEN if sc.get("action", "").startswith(("BUY", "HOLD")) else RED if sc.get("action", "").startswith("EXIT") else YEL
-    print(f"\n{BOLD}SCHD — EQUITY LEG{END}  {DIM}(own trend rules; independent of the TLT signals above){END}")
+    mode_txt = f"exit mode: {sc['exit_mode']}" if "error" not in sc else "no data"
+    print(f"\n{BOLD}SCHD — CALL TIMING OVERLAY{END}  {DIM}({mode_txt}; own rules, independent of TLT above){END}")
     if "error" not in sc:
         for g in sc["gate"]:
             print(f"  [{paint(g['on'], 'x', ' ')}] trend gate: {g['name']}")
@@ -1681,7 +1712,9 @@ def render_rich(res: dict, demo: bool) -> None:
         body.append(f"{line}\n")
     body.append("own trend rules; independent of the TLT signals above", style="dim")
     sc_group.append(body)
-    console.print(Panel(Group(*sc_group), title="SCHD — equity leg",
+    sc_title = ("SCHD — call timing overlay"
+                + (f"  ·  exit mode: {sc['exit_mode']}" if "error" not in sc else ""))
+    console.print(Panel(Group(*sc_group), title=sc_title,
                         border_style="red" if sc.get("action", "").startswith("EXIT") else "blue"))
     opt = res.get("options")
     if opt is not None:
@@ -1802,16 +1835,33 @@ THE SCHD LEG (traded, separate engine):
     50-day rising.
   ENTRIES: PULLBACK - tagged the 20-EMA within 3 sessions and closed back
     above it; BREAKOUT - a new 20-day closing high. Both require the gate.
-  EXITS: close < 50-day reduces (swing trend broken), close < 200-day exits
-    (trend broken). No 21-EMA trail -- it scratches constantly in a slow
-    uptrend.
-  RISK: stop = 20-day swing low - 0.5 ATR (wider than TLT's 15-day, because
-    equity trends breathe more); size = (account x risk%) / (entry - stop);
-    first target +2R. --schd-entry adds open P&L and R-multiple.
-  Backtest it with --backtest --schd, and compare entry/exit families with
-  --backtest --schd --ablate (4 variants x 1bp/5bp). SCHD is an income
-  vehicle: dividends compound for holders, so beating buy-and-hold is the
-  bar, and the in-sample caveat applies exactly as it does to TLT.
+  EXITS (--schd-exit, default 'trend'):
+    swing  - flatten on close < 50-day or < 200-day. The share-overlay
+             baseline; measured, kept, and NOT the default: on the real tape
+             it produced dozens of 2-5 session scratches, which merely bleed
+             in stock but burn premium in calls.
+    reduce - close < 50-day halves the position (restored on a reclaim);
+             close < 200-day flattens. This is what the panel used to claim.
+    trend  - DEFAULT. Flatten only on close < 200-day; the 50-day is a
+             trim/roll warning on the panel, never an auto-flatten.
+    No 21-EMA trail in any mode -- it scratches constantly in a slow uptrend.
+  RISK: the panel prints NO share size -- calls only. It prints the setup,
+    a suggested hold window in sessions (the p25-p75 of winning trades from
+    this engine's own backtest in the active exit mode, so the expiry can be
+    chosen to cover it), the 50-day warn level and the 200-day invalidation.
+    --schd-entry is an ETF fill reference for open P&L / R on the underlying
+    path -- it is not your call P&L.
+  --backtest --schd prints the swing/reduce/trend comparison on one window
+  (trades, time-in-market, total return, maxDD, avg hold, %holds<=5d, PF,
+  2-5 session scratch count, >=60 session holds) with buy-and-hold rows for
+  context. Naming a mode (--schd-exit swing) prints that mode in detail.
+  Read it as ETF-PATH TIMING, not marked-to-market call P&L: a 3-day loser
+  costs far more in calls than the stock % shows, and a 90-day winner is
+  only real if the expiry covered it. The stock-vs-B&H gap is expected --
+  this is a timing overlay, not an ETF replacement, and beating buy-and-hold
+  is NOT the objective. In-sample caveat applies exactly as it does to TLT.
+  Still unsolved: no historical SCHD option marks, so nothing here measures
+  actual call P&L.
 
 BUYING SCHD CALLS (--options):
   A call holder captures the PRICE leg only -- SCHD's ~3.7% dividend accrues
@@ -1956,7 +2006,7 @@ def main() -> int:
             return None, None
         dur = (15.0, False) if args.demo else fetch_duration()
         res = analyze(frames, account=args.account, risk_pct=args.risk, entry=args.entry, duration=dur,
-                      schd_entry=args.schd_entry)
+                      schd_entry=args.schd_entry, schd_exit=args.schd_exit or "trend")
         if args.allocate:
             res["allocator"] = allocator_snapshot(frames)
         if args.options and "error" not in res["schd"]:
