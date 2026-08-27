@@ -71,7 +71,8 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
   are taken into the 50/200-day band, where bear-market rallies die.
 - **TREND-TURN STACK** (8 conditions): TLT 9>21 EMA, MACD cross, 50-day reclaim,
   50-day slope up, higher swing low; UB momentum cross, UB 50-day reclaim;
-  ^TYX below its 50-day. Tiers: **3/8 = SCOUT** (1/3 size), **5/8 = CONFIRMED**
+  ^TYX below its 50-day. Buyable tiers require at least one TLT-native box:
+  **3/8 = SCOUT** (1/3 size), **5/8 = CONFIRMED**
   (2/3), **close > 200-day = REGIME FLIP** (full). Bottoms are processes — each
   condition is a brick, and confirmation deliberately costs a worse price in
   exchange for better odds.
@@ -137,9 +138,10 @@ engine.
 **Layer 4 — EXIT ENGINE** (the sell signal, evaluated "as if long"):
 **EXIT** on a close under the trail (21-EMA for rentals/swings, 50-day after a
 regime flip) or under the prior 15-day low (the structure stop). **TRIM** on a
-50-day tag-and-reject in a bear regime, or RSI ≥ 70. **CAUTION** when ≥ 2 early
-warnings fire: UB futures lose their 21-EMA, 30y-yield momentum turns back up,
-or a bearish RSI divergence forms on the highs. `--notify` alerts on new
+50-day tag-and-reject in a bear regime, or RSI ≥ 70. **CAUTION** when UB loses
+its 21-EMA during an active TLT bounce, or when ≥ 2 other early warnings fire:
+30y-yield momentum turns back up or a bearish RSI divergence forms on the highs.
+`--notify` alerts on new
 EXIT/TRIM verdicts as well as BUYs.
 
 **Risk**: stop = 15-day swing low − 0.5×ATR; size = (account × risk%) ÷

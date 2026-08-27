@@ -9,8 +9,9 @@ Three-layer model:
                   * BOUNCE  — mean-reversion long off an oversold hook (valid in any regime,
                               rented back to the moving-average band in a bear regime).
                   * TREND-TURN STACK — 8 confirmation conditions across TLT / UB / ^TYX that
-                              light up as a downtrend actually reverses. Tiers: SCOUT >= 3,
-                              CONFIRMED >= 5, REGIME FLIP = close over the 200-day.
+                              light up as a downtrend actually reverses. Buyable tiers require
+                              at least one TLT-native box: SCOUT >= 3, CONFIRMED >= 5,
+                              REGIME FLIP = close over the 200-day.
   3. CROSS-CHECKS — futures/cash divergence and yield-exhaustion divergence.
                 ^TNX is fetched quietly for the 10s30s one-liner only; it is not
                 required for a scan and is not a watchlist row.
@@ -403,6 +404,11 @@ def trend_stack(frames: dict) -> list[dict]:
 
 def stack_tier(items: list[dict], tlt: pd.DataFrame | None) -> tuple[int, str]:
     lit = sum(1 for i in items if i["on"])
+    # UB and yields confirm the TLT turn; they cannot manufacture one without
+    # any of the five TLT-native boxes.
+    tlt_native_lit = sum(1 for i in items[:5] if i["on"])
+    if tlt_native_lit < 1:
+        return lit, "NONE"
     if tlt is not None and pd.notna(_last(tlt, "sma200")) and _last(tlt, "Close") > _last(tlt, "sma200") and lit >= 5:
         return lit, "REGIME FLIP"
     if lit >= 5:
@@ -1072,8 +1078,9 @@ def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict
               and float(tlt["High"].iloc[-1]) >= s50 and close <= s50)
     add("trim", f"Tagged the 50-day target ({fmt(s50)}) and rejected — sell into the band", tagged)
     add("trim", f"RSI {rsi_now:.0f} ≥ 70 — overbought, sell-into-strength zone", rsi_now >= 70)
-    add("warn", "UB futures closed under their 21-EMA — futures lead, cash follows",
-        ub is not None and _last(ub, "Close") < _last(ub, "ema21"))
+    if res["bounce"]["active"]:
+        add("warn", "UB futures closed under their 21-EMA — futures lead, cash follows",
+            ub is not None and _last(ub, "Close") < _last(ub, "ema21"))
     add("warn", "30y yield momentum turning back up (9-EMA > 21-EMA on ^TYX)",
         tyx is not None and _last(tyx, "ema9") > _last(tyx, "ema21"))
     bear_div = False
@@ -1089,11 +1096,15 @@ def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict
     exits = [c for c in conds if c["kind"] == "exit" and c["on"]]
     trims = [c for c in conds if c["kind"] == "trim" and c["on"]]
     warns = [c for c in conds if c["kind"] == "warn" and c["on"]]
+    ub_fade_on_bounce = any(
+        c["on"] and c["name"].startswith("UB futures closed under their 21-EMA")
+        for c in warns
+    )
     if exits:
         verdict = "EXIT — " + exits[0]["short"]
     elif trims:
         verdict = "TRIM — take partial profits"
-    elif len(warns) >= 2:
+    elif ub_fade_on_bounce or len(warns) >= 2:
         verdict = "CAUTION — tighten the stop"
     else:
         verdict = "HOLD — no exit signals"
@@ -1206,8 +1217,9 @@ def daily_state(frames: dict) -> pd.DataFrame:
     conds["c7"] = aligned("UB", "Close") > aligned("UB", "sma50")
     conds["c8"] = aligned("TYX", "Close") < aligned("TYX", "sma50")
     st["stack"] = conds.fillna(False).astype(int).sum(axis=1)
-    flip = (st["stack"] >= 5) & (tlt["Close"] > tlt["sma200"])
-    st["tier"] = np.select([flip, st["stack"] >= 5, st["stack"] >= 3],
+    native_tlt_box = conds[["c1", "c2", "c3", "c4", "c5"]].fillna(False).any(axis=1)
+    flip = native_tlt_box & (st["stack"] >= 5) & (tlt["Close"] > tlt["sma200"])
+    st["tier"] = np.select([flip, native_tlt_box & (st["stack"] >= 5), native_tlt_box & (st["stack"] >= 3)],
                            ["FLIP", "CONFIRMED", "SCOUT"], default="NONE")
 
     score = pd.Series(0.0, index=idx)
@@ -1235,8 +1247,11 @@ def daily_state(frames: dict) -> pd.DataFrame:
     rental = st["tier"].isin(["NONE", "SCOUT"]) & (st["regime"] < -33)
     tag_reject = rental & (tlt["High"] >= tlt["sma50"]) & (tlt["Close"] <= tlt["sma50"])
     st["trim_flag"] = tag_reject | (tlt["rsi14"] >= 70)
-    st["ready"] = (tlt["sma200"].notna() & aligned("UB", "sma200").notna()
-                   & aligned("TYX", "sma200").notna() & st["prior_low"].notna())
+    # Keep the established common-history warm-up when UB exists, but do not
+    # erase the TLT replay solely because the optional UB feed is absent.
+    ub_ready = aligned("UB", "sma200").notna() if frames.get("UB") is not None else pd.Series(True, index=idx)
+    st["ready"] = (tlt["sma200"].notna() & ub_ready & aligned("TYX", "sma200").notna()
+                   & st["prior_low"].notna())
     return st
 
 
@@ -1950,7 +1965,8 @@ Layer 2 - TRIGGERS (when do you actually buy?)
   TREND-TURN STACK (8 conditions): 9/21-EMA cross, MACD cross, 50-day reclaim,
   50-day slope up, higher swing low, UB momentum cross, UB 50-day reclaim,
   30y yield losing its 50-day. Bottoms are processes: each condition is one
-  brick. 3/8 = scout with 1/3 size, 5/8 = confirmed, over the 200-day = regime
+  brick. 3/8 with at least one TLT-native box = scout with 1/3 size; UB/yield
+  boxes cannot create a tier alone. 5/8 = confirmed, over the 200-day = regime
   flip, full position. You never need to predict the low - you pay a slightly
   worse price for a much better probability.
 
@@ -2018,8 +2034,8 @@ Layer 4 - EXITS (the sell signal, evaluated "as if long"):
             the structure stop that overrides everything else.
   TRIM    - tagged the 50-day band from below and got rejected in a bear
             regime, or RSI >= 70: sell strength, don't admire it.
-  CAUTION - two or more early warnings: UB futures lose their 21-EMA first
-            (futures lead down too), 30y-yield momentum turns back up
+  CAUTION - UB futures lose their 21-EMA while a TLT bounce is active (futures
+            lead down too), or two or more other early warnings: 30y-yield momentum turns back up
             (9>21 EMA on ^TYX), bearish RSI divergence on the highs.
   Exits are mode-aware on purpose: a bear-regime rental dies at the first
   momentum crack; a confirmed trend gets room to breathe. Selling is a
