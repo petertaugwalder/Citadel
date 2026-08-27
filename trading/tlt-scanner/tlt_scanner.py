@@ -67,7 +67,7 @@ AUX_TICKERS = {  # fetched quietly as derived inputs — never shown as watchlis
 }
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
-HISTORY_PERIOD = "3y"  # 200-day warmup still leaves a ~2y tradeable window for --backtest
+HISTORY_PERIOD = "max"  # full history: EMAs/RSI converge regardless, and --backtest --from 2020-01-01 needs it
 
 # ----------------------------------------------------------------------------- indicators
 
@@ -509,7 +509,8 @@ def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: 
     elif tier == "SCOUT":
         action, size, hold = "BUY — scout the turn", "1/3 size", "add at CONFIRMED (5/8), stop under swing low"
     elif bounce["active"]:
-        action = "BUY — tactical bounce" if bounce["triggered_today"] else "HOLD bounce — manage"
+        # bounce is a tape signal, never presented as a new entry (2026-08 backtest verdict)
+        action = "BOUNCE signal — tape only, not an entry" if bounce["triggered_today"] else "HOLD bounce — manage"
         size = "small (bear-regime rental)" if regime == "BEARISH" else "1/3 size"
         hold = f"take profits into the 50/200-day band; exit on a close under the 21-EMA{e21_txt}"
     elif regime == "BEARISH":
@@ -732,6 +733,12 @@ def daily_state(frames: dict) -> pd.DataFrame:
     st["exit_trail"] = tlt["Close"] < st["trail"]
     st["exit_struct"] = tlt["Close"] < st["prior_low"]
     st["exit_flag"] = st["exit_trail"] | st["exit_struct"]
+    st["exit_50"] = tlt["Close"] < tlt["sma50"]
+    # allocator gate components (same thresholds as stack conditions c3/c7/c8)
+    st["tlt_gt50"] = conds["c3"].fillna(False)
+    st["zb_gt50"] = conds["c7"].fillna(False)
+    st["tyx_lt50"] = conds["c8"].fillna(False)
+    st["alloc_gate"] = st["tlt_gt50"] & st["zb_gt50"] & st["tyx_lt50"]
     rental = st["tier"].isin(["NONE", "SCOUT"]) & (st["regime"] < -33)
     tag_reject = rental & (tlt["High"] >= tlt["sma50"]) & (tlt["Close"] <= tlt["sma50"])
     st["trim_flag"] = tag_reject | (tlt["rsi14"] >= 70)
@@ -762,16 +769,28 @@ def history_frame(frames: dict, n: int) -> pd.DataFrame:
 TIER_WEIGHT = {"NONE": 0.0, "SCOUT": 1 / 3, "CONFIRMED": 2 / 3, "FLIP": 1.0}
 RENTAL_WEIGHT = 1 / 3
 
+VARIANTS = {
+    1: "current engine",
+    2: "no SCOUT/bounce entries",
+    3: "no SCOUT/bounce + structure/50d exits",
+    4: "allocator gate (TYX<50d & ZB>50d & TLT>50d)",
+}
 
-def backtest(frames: dict, cost_bps: float = 1.0) -> dict:
-    """Bar-by-bar replay of the scanner's buy/sell rules. Signals form on close T,
-    fills happen at open T+1, costs charged per side on weight changes. Position
-    model: tier entries at 1/3 / 2/3 / 1.0 weight, bounce rentals at 1/3, TRIM
-    halves the position once per new trim signal, EXIT flattens."""
+
+def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str | None = None) -> dict:
+    """Bar-by-bar replay. Signals form on close T, fills at open T+1, costs per
+    side on weight changes. Variants (ablation): 1 = current engine (tier opens
+    at 1/3-2/3-1.0, bounce rentals 1/3, TRIM x0.5 once, trail+structure exits);
+    2 = opens only at CONFIRMED/FLIP, no bounce; 3 = variant 2 with the 21-EMA
+    trail replaced by structure/50-day exits; 4 = the experimental allocator
+    (binary 1.0/0: enter on TYX<50d & ZB>50d & TLT>50d, exit on close < prior
+    15-day low or < 50-day, no trims, no tiers)."""
     st = daily_state(frames)
     st = st[st["ready"]].copy()
+    if start:
+        st = st[st.index >= pd.Timestamp(start)]
     if len(st) < 60:
-        return {"error": f"only {len(st)} tradeable sessions after the 200-day warmup"}
+        return {"error": f"only {len(st)} tradeable sessions after warmup/start filter"}
     opens, closes = st["Open"].astype(float), st["Close"].astype(float)
     n = len(st)
     rets = np.zeros(n)
@@ -813,20 +832,32 @@ def backtest(frames: dict, cost_bps: float = 1.0) -> dict:
         weights[i] = weight
 
         row = st.iloc[i]
-        tier_w = TIER_WEIGHT[str(row["tier"])]
-        if weight == 0:
-            if tier_w > 0 and not bool(row["exit_flag"]):
-                pending = (tier_w, str(row["tier"]))
-            elif bool(row["bounce_fresh"]) and not bool(row["exit_flag"]):
-                pending = (RENTAL_WEIGHT, "BOUNCE")
+        if variant == 4:
+            exit_now = bool(row["exit_struct"]) or bool(row["exit_50"])
+            if weight == 0:
+                if bool(row["alloc_gate"]) and not exit_now:
+                    pending = (1.0, "GATE")
+            elif exit_now:
+                pending = (0.0, "STRUCT" if bool(row["exit_struct"]) else "50D")
         else:
-            fresh_trim = bool(row["trim_flag"]) and (i == 0 or not bool(st["trim_flag"].iloc[i - 1]))
-            if bool(row["exit_flag"]):
-                pending = (0.0, "STRUCT" if bool(row["exit_struct"]) else "TRAIL")
-            elif fresh_trim:
-                pending = (weight / 2, "TRIM")
-            elif tier_w > weight:
-                pending = (tier_w, str(row["tier"]))
+            trail_exit = bool(row["exit_trail"]) if variant in (1, 2) else bool(row["exit_50"])
+            exit_now = bool(row["exit_struct"]) or trail_exit
+            tier_w = TIER_WEIGHT[str(row["tier"])]
+            openable = tier_w if (variant == 1 or tier_w >= 2 / 3) else 0.0
+            if weight == 0:
+                if openable > 0 and not exit_now:
+                    pending = (openable, str(row["tier"]))
+                elif variant == 1 and bool(row["bounce_fresh"]) and not exit_now:
+                    pending = (RENTAL_WEIGHT, "BOUNCE")
+            else:
+                fresh_trim = bool(row["trim_flag"]) and (i == 0 or not bool(st["trim_flag"].iloc[i - 1]))
+                if exit_now:
+                    why = "STRUCT" if bool(row["exit_struct"]) else ("TRAIL" if variant in (1, 2) else "50D")
+                    pending = (0.0, why)
+                elif fresh_trim:
+                    pending = (weight / 2, "TRIM")
+                elif tier_w > weight:
+                    pending = (tier_w, str(row["tier"]))
 
     equity = np.cumprod(1 + rets)
     for e in episodes + ([ep] if ep is not None else []):
@@ -860,6 +891,7 @@ def backtest(frames: dict, cost_bps: float = 1.0) -> dict:
 
     years = n / 252
     summary = {
+        "variant": f"{variant}: {VARIANTS[variant]}",
         "window": f"{st.index[0].date()} → {st.index[-1].date()}",
         "sessions": n,
         "cost_bps_per_side": cost_bps,
@@ -897,6 +929,79 @@ def backtest(frames: dict, cost_bps: float = 1.0) -> dict:
     return {"summary": summary, "episodes": trade_rows, "caveats": caveats}
 
 
+def run_ablation(frames: dict, start: str | None = None) -> dict:
+    """All four variants at 1bp and 5bp per side on one window."""
+    rows = []
+    window = bh = None
+    for v in (1, 2, 3, 4):
+        for cost in (1.0, 5.0):
+            r = backtest(frames, cost_bps=cost, variant=v, start=start)
+            if "error" in r:
+                return r
+            s = r["summary"]
+            window, bh = s["window"], s["buy_and_hold_tlt"]
+            rows.append({
+                "variant": v, "name": VARIANTS[v], "cost_bps": cost,
+                "trades": s["trades"]["closed"] + s["trades"]["open_at_end"],
+                "win_rate_pct": s["trades"]["win_rate_pct"],
+                "profit_factor": s["trades"]["profit_factor"],
+                "total_return_pct": s["strategy"]["total_return_pct"],
+                "vs_bh_pct": round(s["strategy"]["total_return_pct"] - bh["total_return_pct"], 2),
+                "max_drawdown_pct": s["strategy"]["max_drawdown_pct"],
+                "time_in_market_pct": s["strategy"]["exposure_pct"],
+            })
+    return {"window": window, "buy_and_hold_tlt": bh, "rows": rows}
+
+
+def render_ablation(res: dict) -> None:
+    if "error" in res:
+        print(f"ablation: {res['error']}", file=sys.stderr)
+        return
+    bh = res["buy_and_hold_tlt"]
+    print(f"\n{BOLD}ABLATION{END}  window {res['window']}   "
+          f"B&H TLT {bh['total_return_pct']:+.2f}% (maxDD {bh['max_drawdown_pct']:.2f}%)")
+    print("=" * 100)
+    hdr = (f"  {'#':>1} {'variant':<40} {'bps':>4} {'trades':>6} {'WR%':>6} {'PF':>6} "
+           f"{'total%':>8} {'vsB&H':>8} {'maxDD%':>8} {'TIM%':>6}")
+    print(DIM + hdr + END)
+    for r in res["rows"]:
+        wr = f"{r['win_rate_pct']:.1f}" if r["win_rate_pct"] is not None else "—"
+        pf = f"{r['profit_factor']:.2f}" if r["profit_factor"] is not None else "—"
+        col = GREEN if r["vs_bh_pct"] > 0 else RED
+        print(f"  {r['variant']} {r['name']:<40.40} {r['cost_bps']:>4.1f} {r['trades']:>6} {wr:>6} {pf:>6} "
+              f"{r['total_return_pct']:>+8.2f} {col}{r['vs_bh_pct']:>+8.2f}{END} "
+              f"{r['max_drawdown_pct']:>8.2f} {r['time_in_market_pct']:>6.1f}")
+    print(f"\n  {DIM}vsB&H = strategy total − buy-and-hold total, same window. "
+          f"All caveats from --backtest apply; everything here is in-sample.{END}\n")
+
+
+def allocator_snapshot(frames: dict) -> dict:
+    """Current allocator position + gate/exit levels for the dashboard panel."""
+    bt = backtest(frames, cost_bps=1.0, variant=4)
+    if "error" in bt:
+        return {"error": bt["error"]}
+    st = daily_state(frames)
+    last = st[st["ready"]].iloc[-1]
+    eps = bt.get("episodes", [])
+    open_ep = eps[-1] if eps and "exit_date" not in eps[-1] else None
+    tlt, zb, tyx = frames["TLT"], frames.get("ZB"), frames.get("TYX")
+    snap = {
+        "position": "LONG 1.0" if open_ep is not None else "FLAT",
+        "since": str(open_ep["entry_date"].date()) if open_ep is not None else None,
+        "entry_px": round(open_ep["entry_px"], 2) if open_ep is not None else None,
+        "gate": [
+            {"name": f"TLT close > 50-day ({_last(tlt, 'sma50'):.2f})", "on": bool(last["tlt_gt50"])},
+            {"name": "ZB close > 50-day" + (f" ({to_32nds(_last(zb, 'sma50'))})" if zb is not None else " (no data)"),
+             "on": bool(last["zb_gt50"])},
+            {"name": "30y yield < 50-day" + (f" ({_last(tyx, 'sma50'):.2f}%)" if tyx is not None else " (no data)"),
+             "on": bool(last["tyx_lt50"])},
+        ],
+        "gate_on": bool(last["alloc_gate"]),
+        "exit_levels": f"close < {float(last['prior_low']):.2f} (prior 15-day low) or < {_last(tlt, 'sma50'):.2f} (50-day)",
+    }
+    return snap
+
+
 def render_backtest(res: dict) -> None:
     if "error" in res:
         print(f"backtest: {res['error']}", file=sys.stderr)
@@ -904,7 +1009,7 @@ def render_backtest(res: dict) -> None:
     s = res["summary"]
     strat, bh, tr = s["strategy"], s["buy_and_hold_tlt"], s["trades"]
     print(f"\n{BOLD}TLT SCANNER BACKTEST{END}  {s['window']}  ({s['sessions']} sessions, "
-          f"{s['cost_bps_per_side']}bps/side)")
+          f"{s['cost_bps_per_side']}bps/side)\n  variant {s['variant']}")
     print("=" * 74)
     print(f"\n{BOLD}{'':22}{'strategy':>12}{'buy & hold':>14}{END}")
     print(f"  {'total return':20}{strat['total_return_pct']:>11.2f}%{bh['total_return_pct']:>13.2f}%")
@@ -1016,6 +1121,16 @@ def render_plain(res: dict, demo: bool) -> None:
     print(f"\n{BOLD}WHAT FLIPS IT{END}")
     for f in p["what_flips_it"]:
         print(f"  -> {f}")
+    alloc = res.get("allocator")
+    if alloc is not None and "error" not in alloc:
+        pos_col = GREEN if alloc["position"].startswith("LONG") else DIM
+        since = f" since {alloc['since']} @ {alloc['entry_px']:.2f}" if alloc["since"] else ""
+        print(f"\n{BOLD}ALLOCATOR (experimental){END}  {pos_col}{BOLD}{alloc['position']}{END}{since}")
+        for g in alloc["gate"]:
+            print(f"  [{paint(g['on'], 'x', ' ')}] {g['name']}")
+        gate_txt = "gate ON — new long allowed" if alloc["gate_on"] else "gate OFF — no new longs"
+        print(f"  {gate_txt}   |   exit: {alloc['exit_levels']}")
+        print(f"  {DIM}binary 1.0/0 sizing; no SCOUT, no bounce, no 21-EMA. Tape above is unchanged.{END}")
     print()
 
 
@@ -1115,6 +1230,22 @@ def render_rich(res: dict, demo: bool) -> None:
     console.print(Panel(Group(plan, Text(), flips), title="plan", border_style="green"))
     console.print(Panel(Group(*ex_group), title="exit engine — as if long TLT",
                         border_style="red" if v.startswith("EXIT") else "green"))
+    alloc = res.get("allocator")
+    if alloc is not None and "error" not in alloc:
+        a_t = Table(box=None, pad_edge=False, show_header=False)
+        a_t.add_column(width=3)
+        a_t.add_column()
+        for g in alloc["gate"]:
+            a_t.add_row(Text("[x]", style="green") if g["on"] else Text("[ ]", style="red"), g["name"])
+        since = f" since {alloc['since']} @ {alloc['entry_px']:.2f}" if alloc["since"] else ""
+        gate_txt = "gate ON — new long allowed" if alloc["gate_on"] else "gate OFF — no new longs"
+        console.print(Panel(
+            Group(Text(alloc["position"] + since,
+                       style="bold green" if alloc["position"].startswith("LONG") else "bold"),
+                  a_t,
+                  Text(f"{gate_txt}   |   exit: {alloc['exit_levels']}"),
+                  Text("binary 1.0/0 sizing; no SCOUT, no bounce, no 21-EMA. Tape above is unchanged.", style="dim")),
+            title="allocator (experimental)", border_style="yellow"))
 
 
 def notify_macos(title: str, message: str) -> None:
@@ -1190,6 +1321,8 @@ Layer 2 - TRIGGERS (when do you actually buy?)
   through 35, and price is back over the 9-EMA (or MACD histogram rising 2 bars).
   Logic: capitulation -> exhaustion -> first sign of demand. In a bear regime
   you sell it into the 50/200-day band, because that is where rallies die.
+  Since the 2026-08 backtest verdict the bounce prints as a TAPE SIGNAL
+  only -- it is never presented as a new entry.
   TREND-TURN STACK (8 conditions): 9/21-EMA cross, MACD cross, 50-day reclaim,
   50-day slope up, higher swing low, ZB momentum cross, ZB 50-day reclaim,
   30y yield losing its 50-day. Bottoms are processes: each condition is one
@@ -1244,6 +1377,17 @@ BACKTEST VERDICT (2024-06-12 -> 2026-08-26, real data, rules as coded):
   discipline, and levels; do not auto-trade the BUY tiers, especially
   flat-state CONFIRMED/FLIP opens. No thresholds were changed on this result.
 
+THE ALLOCATOR (--allocate) -- EXPERIMENTAL:
+  The tape is the product; the allocator is an experiment layered on top.
+  New longs require ALL THREE, else flat: 30y yield < its 50-day, ZB > its
+  50-day, TLT > its 50-day. Size is binary 1.0 or 0 -- no SCOUT opens, no
+  bounce opens, no trims. Exits: close < prior 15-day low OR close < the
+  50-day (the 21-EMA is NOT an allocator exit). Same thresholds as the
+  tape's own conditions -- nothing was retuned to build it. Judge it with
+  --ablate, which runs current engine / no-SCOUT / no-trail / allocator
+  at 1bp and 5bp on the same window (add --from YYYY-MM-DD for a second
+  window). In-sample rules apply to every variant.
+
 Failure modes this design accepts:
   - You will buy some bounces that fail (stopped at ~ -1R by design).
   - You will be late to the exact low (deliberate - confirmation costs price).
@@ -1269,6 +1413,12 @@ def main() -> int:
     ap.add_argument("--entry", type=float, help="your TLT entry price — adds open P&L and R-multiple to the exit engine")
     ap.add_argument("--backtest", action="store_true", help="replay the buy/sell rules bar-by-bar over the full history")
     ap.add_argument("--cost-bps", type=float, default=1.0, help="backtest cost per side in bps (default 1.0)")
+    ap.add_argument("--allocate", action="store_true",
+                    help="experimental allocator: dashboard panel (gate + position), or variant 4 with --backtest")
+    ap.add_argument("--ablate", action="store_true",
+                    help="run the 4-variant ablation (current / no-SCOUT / no-trail / allocator) at 1bp and 5bp")
+    ap.add_argument("--from", dest="from_date", metavar="YYYY-MM-DD",
+                    help="start the backtest/ablation window at this date (earlier data used for warmup)")
     ap.add_argument("--explain", action="store_true", help="print the trading logic and exit")
     args = ap.parse_args()
 
@@ -1276,18 +1426,20 @@ def main() -> int:
         print(LOGIC)
         return 0
 
-    if args.backtest:
+    if args.backtest or args.ablate:
         frames = demo_frames() if args.demo else load_frames(refresh=args.refresh)
         if "TLT" not in frames:
             print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
             return 1
-        res = backtest(frames, cost_bps=args.cost_bps)
-        if args.json:
-            print(json.dumps(res, indent=2, default=str))
+        if args.demo and not args.json:
+            print(f"\n{YEL}{BOLD}[DEMO DATA — synthetic tape, results validate the pipeline, not the strategy]{END}")
+        if args.ablate:
+            res = run_ablation(frames, start=args.from_date)
+            print(json.dumps(res, indent=2, default=str)) if args.json else render_ablation(res)
         else:
-            if args.demo:
-                print(f"\n{YEL}{BOLD}[DEMO DATA — synthetic tape, results validate the pipeline, not the strategy]{END}")
-            render_backtest(res)
+            res = backtest(frames, cost_bps=args.cost_bps,
+                           variant=4 if args.allocate else 1, start=args.from_date)
+            print(json.dumps(res, indent=2, default=str)) if args.json else render_backtest(res)
         return 0
 
     def one_scan(prev: tuple[str, str] | None = None) -> tuple[dict | None, tuple[str, str] | None]:
@@ -1299,6 +1451,8 @@ def main() -> int:
             return None, None
         dur = (15.0, False) if args.demo else fetch_duration()
         res = analyze(frames, account=args.account, risk_pct=args.risk, entry=args.entry, duration=dur)
+        if args.allocate:
+            res["allocator"] = allocator_snapshot(frames)
         action, exitv = res["plan"]["action"], res["exit"]["verdict"]
         if args.history:
             df = history_frame(frames, args.history)

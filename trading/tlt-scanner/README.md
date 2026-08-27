@@ -2,7 +2,9 @@
 
 Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 **ZB futures** (30y T-Bond) and the **30y yield (^TYX)** as confirming tape.
-TLT is the only trade vehicle. Shown on the tape: **TLT / ZB / ^TYX / DBA**.
+TLT is the only trade vehicle. **The tape is the product; `--allocate` is an
+experimental allocator layered on top** (binary gate, details below).
+Shown on the tape: **TLT / ZB / ^TYX / DBA**.
 Fetched quietly as derived inputs, never shown as rows and never required:
 **UB=F** (Ultra Bond confirmation line), **^TNX** (10s30s display one-liner),
 **DBC** (broad-commodity co-flag), plus TLT's live effective duration.
@@ -30,6 +32,8 @@ python tlt_scanner.py --explain   # the trading logic, in the terminal
 | `python tlt_scanner.py` | Full dashboard: tape, regime, triggers, cross-checks, plan |
 | `python tlt_scanner.py --history 15` | What the scanner said each of the last 15 sessions |
 | `python tlt_scanner.py --backtest` | Replay the buy/sell rules bar-by-bar over the full history (`--cost-bps` sets per-side costs, default 1.0) |
+| `python tlt_scanner.py --allocate` | Adds the experimental allocator panel (gate + current position); with `--backtest`, runs the allocator variant |
+| `python tlt_scanner.py --ablate --from 2020-01-01` | 4-variant ablation (current / no-SCOUT / no-trail / allocator) at 1bp and 5bp; `--from` sets the window start |
 | `python tlt_scanner.py --watch 900 --notify` | Re-scan every 15 min, macOS notification on a new BUY |
 | `python tlt_scanner.py --account 50000 --risk 1.0` | Adds position sizing (risk 1% of $50k per trade) |
 | `python tlt_scanner.py --entry 82.50` | Adds open P&L and R-multiple to the exit engine, plus a stop-to-breakeven suggestion past +1R |
@@ -102,6 +106,17 @@ crediting do not flip the vs-B&H verdict. Conclusion: **the dashboard is a
 tape, not an allocator** — use it for regime context, exit discipline, and
 levels; do not auto-trade the BUY tiers, especially flat-state
 CONFIRMED/FLIP opens. No thresholds were changed on this result.
+
+## The allocator (`--allocate`) — experimental
+
+The tape never changes; the allocator is a separate, deliberately dumb layer
+built from thresholds the tape already computes (nothing retuned): **new
+longs only when 30y yield < its 50-day AND ZB > its 50-day AND TLT > its
+50-day; size binary 1.0/0; no SCOUT opens, no bounce opens, no trims; exits
+on a close under the prior 15-day low or the 50-day (never the 21-EMA).**
+The bounce is now a tape signal only — it is never presented as a new entry.
+Judge the allocator with `--ablate`, which compares all four variants at 1bp
+and 5bp on the same window; every variant is in-sample.
 
 ## Design notes / accepted tradeoffs
 
