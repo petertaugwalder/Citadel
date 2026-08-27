@@ -13,6 +13,11 @@ Three-layer model:
                               CONFIRMED >= 5, REGIME FLIP = close over the 200-day.
   3. CROSS-CHECKS — futures/cash divergence, yield-exhaustion divergence, and the
                 commodity (DBA) inflation tape as a structural headwind flag.
+  4. EXIT ENGINE — the sell signal, evaluated "as if long": trail breaks (21-EMA for
+                rentals/swings, 50-day once the regime flipped), a hard structure stop
+                (close under the prior 15-day low), trim-into-strength triggers, and
+                early warnings from ZB futures and the 30y yield. Pass --entry to see
+                your open P&L and R-multiple against the current stop.
 
 Data: Yahoo Finance daily bars via yfinance (cached locally). This is an end-of-day /
 swing tool, not an intraday one. Nothing here is financial advice.
@@ -424,7 +429,82 @@ def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: 
     return {"action": action, "size": size, "management": hold, "levels": levels, "what_flips_it": flips}
 
 
-def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0) -> dict:
+def exit_engine(frames: dict, res: dict, entry: float | None) -> dict:
+    """The sell signal, evaluated as if long TLT. Mode-aware: rentals exit fast
+    (21-EMA trail), a flipped regime gets room (50-day trail); the prior 15-day
+    low is the structure stop in every mode."""
+    tlt = frames["TLT"]
+    zb, tyx = frames.get("ZB"), frames.get("TYX")
+    close = _last(tlt, "Close")
+    e21, s50 = _last(tlt, "ema21"), _last(tlt, "sma50")
+    rsi_now = _last(tlt, "rsi14")
+    prior_low = tlt["Low"].rolling(15).min().shift(1)
+    hard_stop = float(prior_low.iloc[-1]) if pd.notna(prior_low.iloc[-1]) else float("nan")
+    tier = res["stack"]["tier"]
+    trail_name, trail = ("50-day", s50) if tier == "REGIME FLIP" else ("21-EMA", e21)
+
+    def fmt(x):
+        return f"{x:.2f}" if pd.notna(x) else "n/a"
+
+    conds: list[dict] = []
+
+    def add(kind, name, active, short=None):
+        conds.append({"kind": kind, "name": name, "on": bool(active), "short": short or name})
+
+    add("exit", f"Close under the prior 15-day low ({fmt(hard_stop)}) — structure broken",
+        pd.notna(hard_stop) and close < hard_stop, "structure broken")
+    add("exit", f"Close under the {trail_name} trail ({fmt(trail)})",
+        pd.notna(trail) and close < trail, f"{trail_name} trail broken")
+    in_bear_rental = tier in ("NONE", "SCOUT") and res["regime"]["label"] == "BEARISH"
+    tagged = (in_bear_rental and pd.notna(s50)
+              and float(tlt["High"].iloc[-1]) >= s50 and close <= s50)
+    add("trim", f"Tagged the 50-day target ({fmt(s50)}) and rejected — sell into the band", tagged)
+    add("trim", f"RSI {rsi_now:.0f} ≥ 70 — overbought, sell-into-strength zone", rsi_now >= 70)
+    add("warn", "ZB futures closed under their 21-EMA — futures lead, cash follows",
+        zb is not None and _last(zb, "Close") < _last(zb, "ema21"))
+    add("warn", "30y yield momentum turning back up (9-EMA > 21-EMA on ^TYX)",
+        tyx is not None and _last(tyx, "ema9") > _last(tyx, "ema21"))
+    bear_div = False
+    highs = pivot_points(tlt["High"], w=4, kind="high")
+    if len(highs) >= 2:
+        d1, d2 = highs.index[-2], highs.index[-1]
+        bear_div = (float(highs.iloc[-1]) > float(highs.iloc[-2])
+                    and float(tlt["rsi14"].loc[d2]) < float(tlt["rsi14"].loc[d1]))
+    add("warn", "Bearish divergence: higher TLT high on weaker RSI — rally exhausting", bear_div)
+
+    exits = [c for c in conds if c["kind"] == "exit" and c["on"]]
+    trims = [c for c in conds if c["kind"] == "trim" and c["on"]]
+    warns = [c for c in conds if c["kind"] == "warn" and c["on"]]
+    if exits:
+        verdict = "EXIT — " + exits[0]["short"]
+    elif trims:
+        verdict = "TRIM — take partial profits"
+    elif len(warns) >= 2:
+        verdict = "CAUTION — tighten the stop"
+    else:
+        verdict = "HOLD — no exit signals"
+
+    out = {
+        "verdict": verdict,
+        "conditions": conds,
+        "trail": {"name": trail_name, "level": round(trail, 2) if pd.notna(trail) else None},
+        "hard_stop": round(hard_stop, 2) if pd.notna(hard_stop) else None,
+    }
+    if entry:
+        pnl_pct = (close - entry) / entry * 100
+        r_den = max(entry - hard_stop, 0.01) if pd.notna(hard_stop) else None
+        r_mult = round((close - entry) / r_den, 2) if r_den else None
+        out["position"] = {
+            "entry": entry,
+            "pnl_pct": round(pnl_pct, 2),
+            "r_multiple": r_mult,
+            "note": "≥ +1R open — move stop to breakeven" if r_mult is not None and r_mult >= 1 else None,
+        }
+    return out
+
+
+def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
+            entry: float | None = None) -> dict:
     comps = regime_components(frames)
     score, label = regime_score(comps)
     res: dict = {
@@ -450,6 +530,7 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0) -
             "roc20": round(_last(df, "roc20"), 1),
         }
     res["plan"] = action_and_levels(frames, res, account, risk_pct)
+    res["exit"] = exit_engine(frames, res, entry)
     return res
 
 
@@ -486,6 +567,8 @@ def history_frame(frames: dict, n: int) -> pd.DataFrame:
     stack_n = conds.fillna(False).astype(int).sum(axis=1)
     bounce = bounce_series(tlt)
 
+    prior_low = tlt["Low"].rolling(15).min().shift(1)
+    exit_now = (tlt["Close"] < tlt["ema21"]) | (tlt["Close"] < prior_low)
     out = pd.DataFrame(
         {
             "close": tlt["Close"].round(2),
@@ -494,6 +577,7 @@ def history_frame(frames: dict, n: int) -> pd.DataFrame:
             "stack": stack_n.astype(str) + "/8",
             "bounce": np.where(bounce, "BUY", ""),
             "tier": np.select([stack_n >= 5, stack_n >= 3], ["CONFIRMED", "SCOUT"], ""),
+            "exit": np.where(exit_now, "EXIT", ""),
         }
     ).tail(n)
     out.index = [str(d.date()) for d in out.index]
@@ -561,6 +645,19 @@ def render_plain(res: dict, demo: bool) -> None:
     print(f"  entry ~{lv['entry']:.2f}   stop {lv['stop']:.2f}   risk/share {lv['risk_per_share']:.2f}   targets {tgt}{r1}")
     if "shares_for_risk" in lv:
         print(f"  size for {lv['risk_amount']:.0f} risk: {BOLD}{lv['shares_for_risk']} shares{END}")
+    ex = res["exit"]
+    v = ex["verdict"]
+    v_col = RED if v.startswith("EXIT") else YEL if v.startswith(("TRIM", "CAUTION")) else GREEN
+    print(f"\n{BOLD}EXIT ENGINE (as if long TLT){END}  {v_col}{BOLD}{v}{END}")
+    for c in ex["conditions"]:
+        mark_col = RED if c["kind"] == "exit" else YEL
+        mark = f"{mark_col}!{END}" if c["on"] else " "
+        print(f"  [{mark}] {c['name']}")
+    if ex.get("position"):
+        pos = ex["position"]
+        r_txt = f" ({pos['r_multiple']:+.2f}R)" if pos.get("r_multiple") is not None else ""
+        note = f"   ← {pos['note']}" if pos.get("note") else ""
+        print(f"  position: entry {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt}{note}")
     print(f"\n{BOLD}WHAT FLIPS IT{END}")
     for f in p["what_flips_it"]:
         print(f"  -> {f}")
@@ -627,6 +724,22 @@ def render_rich(res: dict, demo: bool) -> None:
     for f in p["what_flips_it"]:
         flips.append(f"→ {f}\n", style="dim")
 
+    ex = res["exit"]
+    v = ex["verdict"]
+    ex_style = "bold red" if v.startswith("EXIT") else "bold yellow" if v.startswith(("TRIM", "CAUTION")) else "bold green"
+    ex_t = Table(box=None, pad_edge=False, show_header=False)
+    ex_t.add_column(width=3)
+    ex_t.add_column()
+    for c in ex["conditions"]:
+        style = ("red" if c["kind"] == "exit" else "yellow") if c["on"] else "dim"
+        ex_t.add_row(Text("[!]" if c["on"] else "[ ]", style=style), Text(c["name"], style=None if c["on"] else "dim"))
+    ex_group = [Text(v, style=ex_style), ex_t]
+    if ex.get("position"):
+        pos = ex["position"]
+        r_txt = f" ({pos['r_multiple']:+.2f}R)" if pos.get("r_multiple") is not None else ""
+        note = f"   ← {pos['note']}" if pos.get("note") else ""
+        ex_group.append(Text(f"position: entry {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt}{note}", style="bold"))
+
     title = f"TLT DURATION SCANNER — {res['as_of']}" + ("  [DEMO DATA]" if demo else "")
     console.print(Panel(tape, title=title, border_style="blue"))
     console.print(
@@ -641,6 +754,8 @@ def render_rich(res: dict, demo: bool) -> None:
     if notes.plain:
         console.print(Panel(notes, title="cross-checks", border_style="cyan"))
     console.print(Panel(Group(plan, Text(), flips), title="plan", border_style="green"))
+    console.print(Panel(Group(*ex_group), title="exit engine — as if long TLT",
+                        border_style="red" if v.startswith("EXIT") else "green"))
 
 
 def notify_macos(title: str, message: str) -> None:
@@ -697,6 +812,20 @@ Layer 3 - CROSS-CHECKS (is the signal honest?)
     long yields. A hot ag tape (like Aug 2026) argues for renting bounces,
     not marrying them.
 
+Layer 4 - EXITS (the sell signal, evaluated "as if long"):
+  EXIT    - close under the trail (21-EMA for rentals and swings, 50-day once
+            the regime has flipped), or close under the PRIOR 15-day low --
+            the structure stop that overrides everything else.
+  TRIM    - tagged the 50-day band from below and got rejected in a bear
+            regime, or RSI >= 70: sell strength, don't admire it.
+  CAUTION - two or more early warnings: ZB futures lose their 21-EMA first
+            (futures lead down too), 30y-yield momentum turns back up
+            (9>21 EMA on ^TYX), bearish RSI divergence on the highs.
+  Exits are mode-aware on purpose: a bear-regime rental dies at the first
+  momentum crack; a confirmed trend gets room to breathe. Selling is a
+  process like buying -- trim into strength, exit on the trail, and never
+  argue with the structure stop.
+
 Risk (non-negotiable):
   Stop = 15-day swing low minus 0.5 ATR. Size = (account x risk%) / (entry-stop).
   First target = 50-day, second = 200-day / +2R. Never average down a rental.
@@ -723,6 +852,7 @@ def main() -> int:
     ap.add_argument("--alert-exit", action="store_true", help="exit code 2 when action is a BUY (for scripting)")
     ap.add_argument("--account", type=float, help="account size for position sizing")
     ap.add_argument("--risk", type=float, default=1.0, help="risk %% of account per trade (default 1.0)")
+    ap.add_argument("--entry", type=float, help="your TLT entry price — adds open P&L and R-multiple to the exit engine")
     ap.add_argument("--explain", action="store_true", help="print the trading logic and exit")
     args = ap.parse_args()
 
@@ -730,20 +860,21 @@ def main() -> int:
         print(LOGIC)
         return 0
 
-    def one_scan(prev_action: str | None = None) -> tuple[dict | None, str | None]:
+    def one_scan(prev: tuple[str, str] | None = None) -> tuple[dict | None, tuple[str, str] | None]:
         # --watch must see fresh bars every cycle; the 4h cache would otherwise serve stale data
         force = args.refresh or bool(args.watch)
         frames = demo_frames() if args.demo else load_frames(refresh=force)
         if "TLT" not in frames:
             print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
             return None, None
-        res = analyze(frames, account=args.account, risk_pct=args.risk)
+        res = analyze(frames, account=args.account, risk_pct=args.risk, entry=args.entry)
+        action, exitv = res["plan"]["action"], res["exit"]["verdict"]
         if args.history:
             df = history_frame(frames, args.history)
             print(f"\nSignal history — last {args.history} sessions (TLT)\n")
             print(df.to_string())
             print()
-            return res, res["plan"]["action"]
+            return res, (action, exitv)
         if args.json:
             print(json.dumps(res, indent=2, default=str))
         else:
@@ -755,10 +886,13 @@ def main() -> int:
                     use_rich = False
             if not use_rich:
                 render_plain(res, args.demo)
-        action = res["plan"]["action"]
-        if args.notify and action.startswith("BUY") and action != prev_action:
-            notify_macos("TLT scanner", action)
-        return res, action
+        if args.notify:
+            prev_action, prev_exit = prev if prev else (None, None)
+            if action.startswith("BUY") and action != prev_action:
+                notify_macos("TLT scanner", action)
+            if exitv.startswith(("EXIT", "TRIM")) and exitv != prev_exit:
+                notify_macos("TLT scanner", exitv)
+        return res, (action, exitv)
 
     if args.watch:
         prev = None
@@ -771,11 +905,15 @@ def main() -> int:
             print("\nstopped.")
             return 0
 
-    res, action = one_scan()
-    if res is None:
+    res, sig = one_scan()
+    if res is None or sig is None:
         return 1
-    if args.alert_exit and action and action.startswith("BUY"):
-        return 2
+    action, exitv = sig
+    if args.alert_exit:
+        if exitv.startswith("EXIT"):
+            return 3
+        if action.startswith("BUY"):
+            return 2
     return 0
 
 

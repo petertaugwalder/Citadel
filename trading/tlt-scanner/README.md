@@ -28,8 +28,9 @@ python tlt_scanner.py --explain   # the trading logic, in the terminal
 | `python tlt_scanner.py --history 15` | What the scanner said each of the last 15 sessions |
 | `python tlt_scanner.py --watch 900 --notify` | Re-scan every 15 min, macOS notification on a new BUY |
 | `python tlt_scanner.py --account 50000 --risk 1.0` | Adds position sizing (risk 1% of $50k per trade) |
+| `python tlt_scanner.py --entry 82.50` | Adds your open P&L and R-multiple to the exit engine |
 | `python tlt_scanner.py --json` | Machine-readable output for piping |
-| `python tlt_scanner.py --alert-exit` | Exit code 2 when a BUY is on — for scripting/cron |
+| `python tlt_scanner.py --alert-exit` | Exit code 2 on a BUY, 3 on an EXIT — for scripting/cron |
 | `python tlt_scanner.py --demo` | Synthetic data (no network) to see the output shape |
 | `--refresh` / `--plain` | Force re-download / force plain ANSI output |
 
@@ -65,6 +66,14 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
 **Layer 3 — CROSS-CHECKS**: TLT bullish RSI divergence, ^TYX yield-exhaustion
 divergence, ZB/TLT momentum disagreement (futures lead), and the DBA commodity
 tape as an inflation-pressure flag.
+
+**Layer 4 — EXIT ENGINE** (the sell signal, evaluated "as if long"):
+**EXIT** on a close under the trail (21-EMA for rentals/swings, 50-day after a
+regime flip) or under the prior 15-day low (the structure stop). **TRIM** on a
+50-day tag-and-reject in a bear regime, or RSI ≥ 70. **CAUTION** when ≥ 2 early
+warnings fire: ZB futures lose their 21-EMA, 30y-yield momentum turns back up,
+or a bearish RSI divergence forms on the highs. `--notify` alerts on new
+EXIT/TRIM verdicts as well as BUYs.
 
 **Risk**: stop = 15-day swing low − 0.5×ATR; size = (account × risk%) ÷
 (entry − stop); targets = 50-day, then 200-day / +2R.
