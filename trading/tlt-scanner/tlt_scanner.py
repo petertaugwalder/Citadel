@@ -13,12 +13,17 @@ Three-layer model:
                               CONFIRMED >= 5, REGIME FLIP = close over the 200-day.
   3. CROSS-CHECKS — futures/cash divergence, yield-exhaustion divergence, and the
                 commodity (DBA) tape as a coarse secondary inflation flag (ag
-                futures, not CPI).
+                futures, not CPI). Quietly-fetched aux inputs — UB futures, ^TNX,
+                DBC — feed display lines (live duration, 10s30s one-liner, broad
+                inflation co-flag, UB confirmation) and CAUTION-class warnings
+                only; none is required for a scan and none is a watchlist row.
   4. EXIT ENGINE — the sell signal, evaluated "as if long": trail breaks (21-EMA for
                 rentals/swings, 50-day once the regime flipped), a hard structure stop
                 (close under the prior 15-day low), trim-into-strength triggers, and
-                early warnings from ZB futures and the 30y yield. Pass --entry to see
-                your open P&L and R-multiple against the current stop.
+                early warnings from ZB futures and the 30y yield. Always prints the
+                invalidation price (the close that flips today's verdict to EXIT).
+                Pass --entry to see your open P&L and R-multiple against the current
+                stop, plus a stop-to-breakeven suggestion once past +1R.
 
 Data: Yahoo Finance daily bars via yfinance (cached locally). This is an end-of-day /
 swing tool, not an intraday one. Nothing here is financial advice.
@@ -48,11 +53,17 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-TICKERS = {
+TICKERS = {  # the watchlist — the only rows shown on the tape
     "TLT": "TLT",     # trade vehicle: 20+yr Treasury ETF — the only thing traded
     "ZB": "ZB=F",     # T-Bond futures: leading tape by hours (15-25y basket; UB is the tighter proxy)
     "TYX": "^TYX",    # 30y yield index (drives TLT, inverted)
     "DBA": "DBA",     # ag futures: coarse secondary inflation flag (not CPI)
+}
+AUX_TICKERS = {  # fetched quietly as derived inputs — never shown as watchlist rows,
+                 # never required: a scan runs fine with any or all of these missing
+    "UB": "UB=F",    # Ultra Bond futures: tighter proxy for TLT's 20+y book; confirmation line only
+    "TNX": "^TNX",   # 10y yield: private input for the 10s30s display one-liner (no curve trade)
+    "DBC": "DBC",    # broad commodity basket: informational co-flag for the DBA ag tape
 }
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
@@ -168,7 +179,7 @@ def fetch_yahoo(symbol: str) -> pd.DataFrame | None:
 def load_frames(refresh: bool = False) -> dict[str, pd.DataFrame]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     frames: dict[str, pd.DataFrame] = {}
-    for name, symbol in TICKERS.items():
+    for name, symbol in {**TICKERS, **AUX_TICKERS}.items():
         cache = CACHE_DIR / f"{name}.csv"
         df = None
         if cache.exists() and not refresh and (time.time() - cache.stat().st_mtime) < CACHE_TTL_SEC:
@@ -217,8 +228,46 @@ def demo_frames() -> dict[str, pd.DataFrame]:
         "ZB": (128.0, [(0.55, -0.10), (0.25, -0.04), (0.17, -0.045), (0.03, 0.018)], 0.0045),
         "TYX": (4.10, [(0.55, 0.16), (0.25, 0.05), (0.17, 0.055), (0.03, -0.021)], 0.0065),
         "DBA": (26.0, [(0.70, 0.02), (0.15, -0.03), (0.15, 0.105)], 0.0060),
+        "UB": (135.0, [(0.55, -0.12), (0.25, -0.05), (0.17, -0.05), (0.03, 0.015)], 0.0050),
+        "TNX": (3.90, [(0.55, 0.13), (0.25, 0.03), (0.17, 0.032), (0.03, -0.012)], 0.0060),
+        "DBC": (22.0, [(0.85, 0.01), (0.09, -0.03), (0.06, 0.10)], 0.0055),
     }
     return {k: enrich(_demo_walk(rng, n, s, seg, v)) for k, (s, seg, v) in shapes.items()}
+
+
+def fetch_duration() -> tuple[float, bool]:
+    """TLT effective duration: (value, is_live). Live from Yahoo fund data when
+    possible (cached 7 days); otherwise the 15.0 fallback, marked STALE."""
+    cache = CACHE_DIR / "duration.json"
+    try:
+        if cache.exists() and (time.time() - cache.stat().st_mtime) < 7 * 86400:
+            d = float(json.loads(cache.read_text())["d"])
+            if 5 < d < 30:
+                return d, True
+    except Exception:
+        pass
+    try:
+        import logging
+
+        import yfinance as yf
+
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        bh = yf.Ticker("TLT").funds_data.bond_holdings
+        row = None
+        for label in bh.index:
+            if "duration" in str(label).lower():
+                row = bh.loc[label]
+                break
+        if row is not None:
+            for v in row:
+                d = float(v)
+                if 5 < d < 30:
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    cache.write_text(json.dumps({"d": d}))
+                    return d, True
+    except Exception:
+        pass
+    return 15.0, False
 
 
 # ----------------------------------------------------------------------------- analysis
@@ -359,18 +408,82 @@ def divergences(frames: dict) -> list[str]:
     return notes
 
 
-def macro_checks(frames: dict) -> list[str]:
+def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
+    """Derived inputs from the quietly-fetched aux series. Everything here is
+    display / CAUTION material only — no buy/sell booleans, no EXIT rules."""
+    d_val, d_live = duration
+    tlt, tyx, tnx = frames.get("TLT"), frames.get("TYX"), frames.get("TNX")
+    zb, ub, dba, dbc = frames.get("ZB"), frames.get("UB"), frames.get("DBA"), frames.get("DBC")
+    out: dict = {"duration": {"D": round(d_val, 2), "live": bool(d_live)}}
+    if tyx is not None and len(tyx) >= 2:
+        dy_bp = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-2]) * 100
+        out["duration"]["today_dy_bp"] = round(dy_bp, 1)
+        out["duration"]["implied_1d_pct"] = round(-d_val * dy_bp / 100, 2)
+    if tlt is not None and tyx is not None and len(tyx) >= 6 and len(tlt) >= 6:
+        dy5 = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-6])
+        implied5 = -d_val * dy5
+        actual5 = float(tlt["Close"].iloc[-1] / tlt["Close"].iloc[-6] - 1) * 100
+        out["residual"] = {"implied_5d_pct": round(implied5, 2), "actual_5d_pct": round(actual5, 2),
+                           "residual_pct": round(actual5 - implied5, 2)}
+    if tyx is not None and tnx is not None:
+        spread = (tyx["Close"] - tnx["Close"].reindex(tyx.index).ffill()).dropna()
+        if len(spread) >= 6:
+            bp = float(spread.iloc[-1]) * 100
+            d5 = float(spread.iloc[-1] - spread.iloc[-6]) * 100
+            label = "STEEPENING" if d5 > 3 else "FLATTENING" if d5 < -3 else "FLAT"
+            y_up5 = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-6]) > 0
+            out["curve"] = {"spread_bp": round(bp, 0), "chg5_bp": round(d5, 0), "label": label,
+                            "bear_steepener": bool(d5 > 3 and y_up5),
+                            "bull_flattener": bool(d5 < -3 and not y_up5)}
+    if zb is not None and ub is not None:
+        zb_h = _last(zb, "Close") > _last(zb, "ema21")
+        ub_h = _last(ub, "Close") > _last(ub, "ema21")
+        out["ub"] = {"zb_holds_21ema": bool(zb_h), "ub_holds_21ema": bool(ub_h), "split": bool(zb_h != ub_h)}
+    if dba is not None and not np.isnan(_last(dba, "roc20")):
+        out["ags_roc20"] = round(_last(dba, "roc20"), 1)
+    if dbc is not None and not np.isnan(_last(dbc, "roc20")):
+        out["broad_roc20"] = round(_last(dbc, "roc20"), 1)
+    return out
+
+
+def macro_checks(frames: dict, aux: dict) -> list[str]:
     notes = []
-    dba = frames.get("DBA")
-    if dba is not None:
-        r = _last(dba, "roc20")
-        if not np.isnan(r):
-            if r > 4:
-                notes.append(f"Inflation tape (coarse, ags only): DBA +{r:.1f}%/20d — pressure on yields; cap bounce targets")
-            elif r < -4:
-                notes.append(f"Inflation tape (coarse, ags only): DBA {r:.1f}%/20d — commodity disinflation, a TLT tailwind")
-            else:
-                notes.append(f"Inflation tape (coarse, ags only): DBA {r:+.1f}%/20d — neutral")
+    d = aux["duration"]
+    tag = " (live, weekly cache)" if d["live"] else " (fallback 15.0 — STALE)"
+    line = f"Duration: D≈{d['D']:.2f}{tag}"
+    if "today_dy_bp" in d:
+        line += f" | today Δy {d['today_dy_bp']:+.0f}bp → ~{d['implied_1d_pct']:+.2f}% first-order"
+    notes.append(line)
+    res = aux.get("residual")
+    if res is not None and abs(res["residual_pct"]) > 0.75:
+        side = "lagging" if res["residual_pct"] < 0 else "running ahead of"
+        notes.append(f"Residual (cross-check only): TLT {side} the duration-implied move over 5d "
+                     f"(actual {res['actual_5d_pct']:+.2f}% vs implied {res['implied_5d_pct']:+.2f}%)")
+    c = aux.get("curve")
+    if c is not None:
+        line = f"Curve (display only): 10s30s {c['spread_bp']:.0f}bp ({c['chg5_bp']:+.0f}bp/5d) — {c['label']}"
+        if c["bear_steepener"]:
+            line += " | bear steepener, worse for TLT"
+        elif c["bull_flattener"]:
+            line += " | bull flattener, better for TLT"
+        notes.append(line)
+    u = aux.get("ub")
+    if u is not None:
+        zb_txt = "holds" if u["zb_holds_21ema"] else "lost"
+        ub_txt = "holds" if u["ub_holds_21ema"] else "lost"
+        state = "SPLIT — UB is the closer proxy for TLT's 20+y book" if u["split"] else "aligned"
+        notes.append(f"UB confirm: ZB {zb_txt} its 21-EMA, UB {ub_txt} its 21-EMA — {state}")
+    dba_r, dbc_r = aux.get("ags_roc20"), aux.get("broad_roc20")
+    if dba_r is not None:
+        if dba_r > 4:
+            line = f"Inflation tape (coarse, ags only): DBA +{dba_r:.1f}%/20d — pressure on yields; cap bounce targets"
+        elif dba_r < -4:
+            line = f"Inflation tape (coarse, ags only): DBA {dba_r:.1f}%/20d — commodity disinflation, a TLT tailwind"
+        else:
+            line = f"Inflation tape (coarse, ags only): DBA {dba_r:+.1f}%/20d — neutral"
+        if dbc_r is not None:
+            line += f" | broad (DBC) {dbc_r:+.1f}%/20d"
+        notes.append(line)
     return notes
 
 
@@ -431,7 +544,7 @@ def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: 
     return {"action": action, "size": size, "management": hold, "levels": levels, "what_flips_it": flips}
 
 
-def exit_engine(frames: dict, res: dict, entry: float | None) -> dict:
+def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict:
     """The sell signal, evaluated as if long TLT. Mode-aware: rentals exit fast
     (21-EMA trail), a flipped regime gets room (50-day trail); the prior 15-day
     low is the structure stop in every mode. Risk-management heuristics that
@@ -474,6 +587,13 @@ def exit_engine(frames: dict, res: dict, entry: float | None) -> dict:
         bear_div = (float(highs.iloc[-1]) > float(highs.iloc[-2])
                     and float(tlt["rsi14"].loc[d2]) < float(tlt["rsi14"].loc[d1]))
     add("warn", "Bearish divergence: higher TLT high on weaker RSI — rally exhausting", bear_div)
+    add("warn", "ZB/UB split on the 21-EMA — long-end signal disagreement (UB tracks TLT's book closer)",
+        aux.get("ub", {}).get("split", False))
+    add("warn", "Bear-steepening curve while the bounce is on — this tape kills rallies early",
+        aux.get("curve", {}).get("bear_steepener", False) and res["bounce"]["active"])
+    dba_r, dbc_r = aux.get("ags_roc20"), aux.get("broad_roc20")
+    add("warn", "Ag AND broad commodities hot (+4%/20d both) — inflation pressure is broad-based",
+        dba_r is not None and dbc_r is not None and dba_r > 4 and dbc_r > 4)
 
     exits = [c for c in conds if c["kind"] == "exit" and c["on"]]
     trims = [c for c in conds if c["kind"] == "trim" and c["on"]]
@@ -487,42 +607,59 @@ def exit_engine(frames: dict, res: dict, entry: float | None) -> dict:
     else:
         verdict = "HOLD — no exit signals"
 
+    inv_candidates = [x for x in (trail, hard_stop) if pd.notna(x)]
     out = {
         "verdict": verdict,
         "conditions": conds,
         "trail": {"name": trail_name, "level": round(trail, 2) if pd.notna(trail) else None},
         "hard_stop": round(hard_stop, 2) if pd.notna(hard_stop) else None,
+        # first level crossed on the way down — a close under it flips today's verdict to EXIT
+        "invalidation": round(max(inv_candidates), 2) if inv_candidates else None,
     }
     if entry:
         pnl_pct = (close - entry) / entry * 100
-        r_den = max(entry - hard_stop, 0.01) if pd.notna(hard_stop) else None
-        r_mult = round((close - entry) / r_den, 2) if r_den else None
+        if pd.notna(hard_stop) and entry > hard_stop:
+            r_mult = round((close - entry) / (entry - hard_stop), 2)
+            at_be = r_mult >= 1
+            note = "≥ +1R open — move stop to breakeven" if at_be else None
+        else:
+            # today's 15-day structure stop already sits above the entry: risk vs
+            # the current stop is zero, so an R-multiple against it is meaningless
+            r_mult, at_be = None, False
+            note = (f"structure stop {hard_stop:.2f} is above your entry — already past breakeven"
+                    if pd.notna(hard_stop) else None)
         out["position"] = {
             "entry": entry,
             "pnl_pct": round(pnl_pct, 2),
             "r_multiple": r_mult,
-            "note": "≥ +1R open — move stop to breakeven" if r_mult is not None and r_mult >= 1 else None,
+            "note": note,
+            "be_level": round(entry, 2) if at_be else None,
         }
     return out
 
 
 def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
-            entry: float | None = None) -> dict:
+            entry: float | None = None, duration: tuple[float, bool] = (15.0, False)) -> dict:
     comps = regime_components(frames)
     score, label = regime_score(comps)
+    aux = aux_metrics(frames, duration)
     res: dict = {
         "as_of": str(frames["TLT"].index[-1].date()),
         "regime": {"score": score, "label": label, "components": comps},
         "bounce": bounce_state(frames["TLT"]),
         "stack": {},
         "divergences": divergences(frames),
-        "macro": macro_checks(frames),
+        "aux": aux,
+        "macro": macro_checks(frames, aux),
         "tape": {},
     }
     items = trend_stack(frames)
     lit, tier = stack_tier(items, frames.get("TLT"))
     res["stack"] = {"items": items, "lit": lit, "of": len(items), "tier": tier}
-    for name, df in frames.items():
+    for name in TICKERS:  # watchlist rows only — aux series never appear on the tape
+        df = frames.get(name)
+        if df is None:
+            continue
         res["tape"][name] = {
             "close": round(_last(df, "Close"), 3),
             "chg1": round(_last(df, "chg1"), 2),
@@ -533,7 +670,7 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
             "roc20": round(_last(df, "roc20"), 1),
         }
     res["plan"] = action_and_levels(frames, res, account, risk_pct)
-    res["exit"] = exit_engine(frames, res, entry)
+    res["exit"] = exit_engine(frames, res, entry, aux)
     return res
 
 
@@ -867,11 +1004,15 @@ def render_plain(res: dict, demo: bool) -> None:
         mark_col = RED if c["kind"] == "exit" else YEL
         mark = f"{mark_col}!{END}" if c["on"] else " "
         print(f"  [{mark}] {c['name']}")
+    if ex.get("invalidation") is not None:
+        print(f"  invalidation today: a close under {BOLD}{ex['invalidation']:.2f}{END} flips this to EXIT")
     if ex.get("position"):
         pos = ex["position"]
         r_txt = f" ({pos['r_multiple']:+.2f}R)" if pos.get("r_multiple") is not None else ""
         note = f"   ← {pos['note']}" if pos.get("note") else ""
         print(f"  position: entry {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt}{note}")
+        if pos.get("be_level") is not None and ex["trail"]["level"] is not None:
+            print(f"  engine trail stays {ex['trail']['level']:.2f} | ≥ +1R → suggest stop to breakeven {pos['be_level']:.2f}")
     print(f"\n{BOLD}WHAT FLIPS IT{END}")
     for f in p["what_flips_it"]:
         print(f"  -> {f}")
@@ -948,11 +1089,15 @@ def render_rich(res: dict, demo: bool) -> None:
         style = ("red" if c["kind"] == "exit" else "yellow") if c["on"] else "dim"
         ex_t.add_row(Text("[!]" if c["on"] else "[ ]", style=style), Text(c["name"], style=None if c["on"] else "dim"))
     ex_group = [Text(v, style=ex_style), ex_t]
+    if ex.get("invalidation") is not None:
+        ex_group.append(Text(f"invalidation today: a close under {ex['invalidation']:.2f} flips this to EXIT", style="bold"))
     if ex.get("position"):
         pos = ex["position"]
         r_txt = f" ({pos['r_multiple']:+.2f}R)" if pos.get("r_multiple") is not None else ""
         note = f"   ← {pos['note']}" if pos.get("note") else ""
         ex_group.append(Text(f"position: entry {pos['entry']:.2f} → {pos['pnl_pct']:+.2f}%{r_txt}{note}", style="bold"))
+        if pos.get("be_level") is not None and ex["trail"]["level"] is not None:
+            ex_group.append(Text(f"engine trail stays {ex['trail']['level']:.2f} | ≥ +1R → suggest stop to breakeven {pos['be_level']:.2f}"))
 
     title = f"TLT DURATION SCANNER — {res['as_of']}" + ("  [DEMO DATA]" if demo else "")
     console.print(Panel(tape, title=title, border_style="blue"))
@@ -999,6 +1144,9 @@ What TLT is: packaged long-duration risk. First-order estimate:
   premium/discount mean realized TLT will not match the estimate -- the
   mid-Aug snapback mapped a ~15bp 30y drop to a ~2.2% duration estimate vs
   ~+1.6% observed. Still: you are trading the DIRECTION OF LONG YIELDS.
+  The dashboard prints live D from Yahoo's fund data when available (weekly
+  cache; falls back to 15.0 marked STALE) plus a 5-session actual-vs-implied
+  residual -- a cross-check only, never a buy/sell boolean or veto.
 
 Why three instruments (one market, three quotes):
   Cash 30y yields, ZB futures, and TLT are three quotes of the same long-end
@@ -1018,9 +1166,17 @@ Why three instruments (one market, three quotes):
                       and the 23h session.
   TLT               - what you can actually buy; where entries/stops live.
 
-Dropped on purpose: ^TNX and the 10s30s curve check. ^TYX is the better
-  single driver for TLT; the accepted cost is that we cannot distinguish
-  bear-steepeners from bull-flatteners. Do not silently re-add it.
+Not on the watchlist, fetched quietly as derived inputs (any may be missing
+  and the scan still runs; none has a buy/sell boolean or an EXIT rule):
+  UB (Ultra Bond futures) - the tighter proxy for TLT's 20+y book, used only
+    as a confirmation line; a ZB/UB split on their 21-EMAs is CAUTION fuel.
+  ^TNX (10y yield) - only to print the 10s30s one-liner. There is no curve
+    trade: bear steepeners (yields up, 10s30s wider) are the worse tape for
+    TLT, bull flatteners (yields down, tighter) the better one, and the one
+    coded consequence is a CAUTION-class warning when bear-steepening
+    coincides with an active bounce.
+  DBC (broad commodities) - informational co-flag next to the coarse DBA ag
+    tape; only when BOTH run hot does it add one CAUTION-class warning.
 
 Layer 1 - REGIME (should you even be hunting longs?)
   Moving-average structure (price vs 50d/200d, 50d slope, 50d vs 200d) scored
@@ -1064,6 +1220,11 @@ Layer 4 - EXITS (the sell signal, evaluated "as if long"):
   momentum crack; a confirmed trend gets room to breathe. Selling is a
   process like buying -- trim into strength, exit on the trail, and never
   argue with the structure stop.
+  The panel always prints the INVALIDATION price -- the single close (the
+  higher of the active trail and the structure stop, since either break is
+  an EXIT) that flips today's verdict to EXIT. With --entry, once the open
+  gain passes +1R the engine keeps printing its trail unchanged and adds a
+  separate stop-to-breakeven suggestion alongside it.
   These are risk-management heuristics, not a validated edge: the 15-day
   lookback is arbitrary, and RSI>=70 will scratch you out of some squeezes
   that keep running. They bound losses; they do not predict.
@@ -1125,7 +1286,8 @@ def main() -> int:
         if "TLT" not in frames:
             print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
             return None, None
-        res = analyze(frames, account=args.account, risk_pct=args.risk, entry=args.entry)
+        dur = (15.0, False) if args.demo else fetch_duration()
+        res = analyze(frames, account=args.account, risk_pct=args.risk, entry=args.entry, duration=dur)
         action, exitv = res["plan"]["action"], res["exit"]["verdict"]
         if args.history:
             df = history_frame(frames, args.history)

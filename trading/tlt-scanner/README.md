@@ -2,7 +2,10 @@
 
 Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 **ZB futures** (30y T-Bond) and the **30y yield (^TYX)** as confirming tape.
-TLT is the only trade vehicle.
+TLT is the only trade vehicle. Shown on the tape: **TLT / ZB / ^TYX / DBA**.
+Fetched quietly as derived inputs, never shown as rows and never required:
+**UB=F** (Ultra Bond confirmation line), **^TNX** (10s30s display one-liner),
+**DBC** (broad-commodity co-flag), plus TLT's live effective duration.
 Daily (end-of-day) data from Yahoo Finance, cached locally. Built for iTerm —
 rich TUI dashboard with a plain-ANSI fallback.
 
@@ -29,7 +32,7 @@ python tlt_scanner.py --explain   # the trading logic, in the terminal
 | `python tlt_scanner.py --backtest` | Replay the buy/sell rules bar-by-bar over the full history (`--cost-bps` sets per-side costs, default 1.0) |
 | `python tlt_scanner.py --watch 900 --notify` | Re-scan every 15 min, macOS notification on a new BUY |
 | `python tlt_scanner.py --account 50000 --risk 1.0` | Adds position sizing (risk 1% of $50k per trade) |
-| `python tlt_scanner.py --entry 82.50` | Adds your open P&L and R-multiple to the exit engine |
+| `python tlt_scanner.py --entry 82.50` | Adds open P&L and R-multiple to the exit engine, plus a stop-to-breakeven suggestion past +1R |
 | `python tlt_scanner.py --json` | Machine-readable output for piping |
 | `python tlt_scanner.py --alert-exit` | Exit code 2 on a BUY, 3 on an EXIT — for scripting/cron |
 | `python tlt_scanner.py --demo` | Synthetic data (no network) to see the output shape |
@@ -69,6 +72,13 @@ divergence, ZB/TLT momentum disagreement (ZB leads by hours), and the DBA
 commodity tape as a **coarse secondary inflation flag** — DBA is agriculture
 futures, not CPI; food is one slice of bond-relevant inflation, and a DBA
 spike can be weather or cocoa saying nothing about 30y term premium.
+The aux inputs add display lines here: live duration (`D≈…` with the
+first-order Δy mapping, STALE-marked 15.0 fallback), a 5-session
+actual-vs-duration-implied residual (cross-check only), the 10s30s
+STEEPENING/FLATTENING one-liner, a `UB confirm` aligned/SPLIT line, and
+`| broad (DBC)` appended to the inflation line. Three of these can each add
+one CAUTION-class warning (ZB/UB split; bear-steepening during an active
+bounce; DBA and DBC hot together) — never an EXIT, never a buy/sell boolean.
 
 **Layer 4 — EXIT ENGINE** (the sell signal, evaluated "as if long"):
 **EXIT** on a close under the trail (21-EMA for rentals/swings, 50-day after a
@@ -97,9 +107,16 @@ EXIT/TRIM verdicts as well as BUYs.
   and conversion factors keep them close, not identical. Ultra Bond (UB) is
   the tighter duration proxy if we ever swap; ZB stays for liquidity and the
   23h session.
-- **^TNX / 10s30s dropped deliberately.** ^TYX is the better single driver
-  for TLT; the accepted cost is no bear-steepener vs bull-flattener
-  visibility.
+- **^TNX is not a watchlist ticker.** It is fetched privately only for the
+  10s30s display line (bear steepener = worse for TLT, bull flattener =
+  better) — there is no curve trade and no curve EXIT. ^TYX remains the
+  single driver in the signal logic.
+- **UB is a confirmation line, not a signal source.** ZB stays the primary
+  23h tape and keeps the 21-EMA warning; a ZB/UB disagreement is CAUTION
+  fuel only, and a missing UB feed never fails a scan.
+- **Duration is displayed live, used nowhere.** D comes from Yahoo fund data
+  on a weekly cache and falls back to 15.0 marked STALE; the
+  actual-vs-implied residual it enables is a cross-check line only.
 - **The exit rules are risk-management heuristics, not a validated edge.**
   The 15-day lookback is arbitrary, and RSI ≥ 70 will scratch some squeezes
   that keep running. They bound losses; they do not predict.
