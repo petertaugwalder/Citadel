@@ -168,6 +168,37 @@ The bounce is now a tape signal only — it is never presented as a new entry.
 Judge the allocator with `--ablate`, which compares all four variants at 1bp
 and 5bp on the same window; every variant is in-sample.
 
+## Schwab connection (real option greeks)
+
+The call panel uses Schwab's Trader API when you're logged in — real greeks and
+two-sided quotes instead of a Black-Scholes estimate — and silently falls back
+to yfinance otherwise. **Credentials never live in this repo.**
+
+```bash
+# 1. Register an app at developer.schwab.com (Market Data API is enough for the
+#    call panel). Set the callback URL to exactly:  https://127.0.0.1:8182
+# 2. Put the credentials in your shell (or ~/.config/tlt-scanner/schwab.json, chmod 600):
+export SCHWAB_APP_KEY='...'
+export SCHWAB_APP_SECRET='...'
+# 3. One-time browser auth — prints a URL, you paste back the redirected URL:
+python schwab_client.py login
+python schwab_client.py status          # token ages
+python schwab_client.py chain SCHD      # sanity check
+# 4. The scanner picks it up automatically:
+python tlt_scanner.py --options
+```
+
+- Access tokens last ~30 minutes and refresh automatically; **refresh tokens
+  last 7 days**, so `login` has to be re-run weekly. `status` tells you when.
+- Tokens are written to `~/.config/tlt-scanner/schwab_tokens.json` (chmod 600),
+  outside the repo. `schwab.json`, `schwab_tokens.json` and `.env` are
+  gitignored. `logout` deletes the stored tokens.
+- `--options-source schwab|yfinance|auto` forces or reports the source; the
+  panel prints which one produced the numbers.
+- **What Schwab does not fix:** it serves the *current* chain only. There are
+  no historical option marks, so the SCHD backtest stays ETF-path timing and
+  still measures no realised call P&L.
+
 ## Design notes / accepted tradeoffs
 
 - **Duration math is first-order only.** TLT% ≈ −D × Δyield (in percentage
@@ -212,3 +243,4 @@ and 5bp on the same window; every variant is in-sample.
 - SCHD promoted to a traded leg with its own trend engine and backtest.
 - SCHD ablation (4 entry/exit variants), price-only benchmark, and a call-buyer options panel.
 - SCHD reframed as a call-timing overlay: --schd-exit swing/reduce/trend (default trend), no share sizing.
+- Schwab Trader API client for real option greeks (stdlib only); yfinance fallback retained.

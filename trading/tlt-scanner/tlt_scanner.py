@@ -829,9 +829,22 @@ def _bs_call(S, K, T, sigma, r=RISK_FREE, q=SCHD_DIV_YIELD):
     return delta, theta / 365.0
 
 
-def schd_options(spot: float, min_dte: int = MIN_CALL_DTE, target_delta: float = TARGET_DELTA) -> dict:
+def schd_options(spot: float, min_dte: int = MIN_CALL_DTE, target_delta: float = TARGET_DELTA,
+                 source: str = "auto") -> dict:
     """Live SCHD call chain: pick an expiry with room to run and a strike near the
-    target delta. Never fatal — returns {'error': ...} if the chain is unavailable."""
+    target delta. Prefers Schwab (real greeks, real two-sided quotes) when logged in,
+    else falls back to yfinance + a Black-Scholes estimate. Never fatal — returns
+    {'error': ...} if no chain is available."""
+    if source in ("auto", "schwab"):
+        try:
+            import schwab_client
+
+            return schwab_client.pick_call("SCHD", spot=spot, min_dte=min_dte,
+                                           target_delta=target_delta)
+        except Exception as exc:
+            schwab_err = f"{type(exc).__name__}: {exc}"
+            if source == "schwab":
+                return {"error": f"schwab: {schwab_err}"}
     try:
         import logging
 
@@ -871,6 +884,7 @@ def schd_options(spot: float, min_dte: int = MIN_CALL_DTE, target_delta: float =
             return {"error": "could not price any strikes"}
         pick = min(rows, key=lambda r: abs(r["delta"] - target_delta))
         return {
+            "source": "yfinance+BS",
             "expiry": expiry, "dte": dte, "spot": round(spot, 2),
             "atm_iv_pct": round(atm_iv * 100, 1),
             "strike": pick["strike"], "mid": round(pick["mid"], 2),
@@ -891,15 +905,27 @@ def schd_options(spot: float, min_dte: int = MIN_CALL_DTE, target_delta: float =
 def options_lines(opt: dict) -> list[str]:
     if "error" in opt:
         return [f"n/a — {opt['error']}"]
-    return [
+    src = opt.get("source", "?")
+    lines = [
         f"buy the {opt['expiry']} {opt['strike']:.0f} call  ({opt['dte']}d out, delta {opt['delta']:.2f})",
         f"mid {opt['mid']:.2f}  (bid {opt['bid']:.2f} / ask {opt['ask']:.2f}"
-        + (f", spread {opt['spread_pct']:.0f}% of mid)" if opt["spread_pct"] is not None else ")"),
-        f"ATM IV {opt['atm_iv_pct']:.1f}%   premium {opt['premium_pct_of_notional']:.1f}% of notional",
-        f"breakeven {opt['breakeven']:.2f} (+{opt['breakeven_move_pct']:.1f}% move needed)",
-        f"theta ~{opt['theta_pct_of_premium_per_day']:.2f}% of premium/day   "
-        f"dividends forfeited over the hold: ~{opt['div_forfeited_pct']:.1f}%",
+        + (f", spread {opt['spread_pct']:.0f}% of mid)" if opt.get("spread_pct") is not None else ")"),
     ]
+    if opt.get("open_interest") is not None:
+        lines.append(f"open interest {opt['open_interest']}   volume {opt.get('volume', 0)}"
+                     "   — thin books make frequent trading expensive")
+    if opt.get("premium_pct_of_notional") is not None:
+        lines.append(f"ATM IV {opt['atm_iv_pct']:.1f}%   premium {opt['premium_pct_of_notional']:.1f}% of notional")
+    if opt.get("breakeven_move_pct") is not None:
+        lines.append(f"breakeven {opt['breakeven']:.2f} (+{opt['breakeven_move_pct']:.1f}% move needed)")
+    theta_line = (f"theta ~{opt['theta_pct_of_premium_per_day']:.2f}% of premium/day"
+                  if opt.get("theta_pct_of_premium_per_day") is not None else "theta n/a")
+    if opt.get("div_forfeited_pct") is not None:
+        theta_line += f"   dividends forfeited over the hold: ~{opt['div_forfeited_pct']:.1f}%"
+    lines.append(theta_line)
+    lines.append(f"source: {src}" + ("  (real greeks)" if src == "schwab"
+                                     else "  (estimated greeks — run schwab_client.py login for real ones)"))
+    return lines
 
 
 def schd_lines(engine: dict) -> list[str]:
@@ -1954,6 +1980,8 @@ def main() -> int:
     ap.add_argument("--schd", action="store_true", help="with --backtest/--ablate: run the SCHD leg instead of TLT")
     ap.add_argument("--options", action="store_true",
                     help="add the SCHD call panel (live chain: expiry, strike, IV, theta, breakeven)")
+    ap.add_argument("--options-source", choices=("auto", "schwab", "yfinance"), default="auto",
+                    help="chain source: auto (Schwab if logged in, else yfinance), or force one")
     ap.add_argument("--min-dte", type=int, default=MIN_CALL_DTE, help=f"minimum days to expiry (default {MIN_CALL_DTE})")
     ap.add_argument("--target-delta", type=float, default=TARGET_DELTA, help=f"target call delta (default {TARGET_DELTA})")
     ap.add_argument("--schd-exit", choices=("swing", "reduce", "trend"), default=None,
@@ -2011,7 +2039,8 @@ def main() -> int:
             res["allocator"] = allocator_snapshot(frames)
         if args.options and "error" not in res["schd"]:
             res["options"] = schd_options(res["schd"]["close"], min_dte=args.min_dte,
-                                          target_delta=args.target_delta)
+                                          target_delta=args.target_delta,
+                                          source=args.options_source)
         action, exitv = res["plan"]["action"], res["exit"]["verdict"]
         if args.history:
             df = history_frame(frames, args.history)
