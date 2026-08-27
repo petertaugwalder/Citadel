@@ -1233,6 +1233,17 @@ Risk (non-negotiable):
   Stop = 15-day swing low minus 0.5 ATR. Size = (account x risk%) / (entry-stop).
   First target = 50-day, second = 200-day / +2R. Never average down a rental.
 
+BACKTEST VERDICT (2024-06-12 -> 2026-08-26, real data, rules as coded):
+  The engine LOST to holding TLT: -12.86% (max DD -18.33%) vs buy-and-hold
+  -1.12% (max DD -14.79%), in the market 46% of the time. 29 trades, win
+  rate 20.7%, profit factor 0.34; 23 of 29 exits were 21-EMA trail stops.
+  The only two real winners (+3.61%, +2.89%) were ~7-week holds that opened
+  at SCOUT and ended on STRUCT exits. Costs at 5bps/side and crediting cash
+  at 0% do not flip the vs-B&H verdict. Conclusion: on this window the
+  dashboard is A TAPE, NOT AN ALLOCATOR -- use it for regime context, exit
+  discipline, and levels; do not auto-trade the BUY tiers, especially
+  flat-state CONFIRMED/FLIP opens. No thresholds were changed on this result.
+
 Failure modes this design accepts:
   - You will buy some bounces that fail (stopped at ~ -1R by design).
   - You will be late to the exact low (deliberate - confirmation costs price).

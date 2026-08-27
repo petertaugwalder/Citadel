@@ -91,6 +91,18 @@ EXIT/TRIM verdicts as well as BUYs.
 **Risk**: stop = 15-day swing low − 0.5×ATR; size = (account × risk%) ÷
 (entry − stop); targets = 50-day, then 200-day / +2R.
 
+## Backtest verdict (2024-06-12 → 2026-08-26, real data)
+
+On this window the engine **lost to holding TLT**: −12.86% (max DD −18.33%)
+vs buy-and-hold −1.12% (max DD −14.79%), 46% time in market. 29 trades,
+win rate 20.7%, profit factor 0.34; 23 of 29 exits were 21-EMA trail stops.
+The only two real winners (+3.61%, +2.89%) were ~7-week holds that opened
+at SCOUT and ended on STRUCT exits. Costs at 5 bps/side and 0%-cash
+crediting do not flip the vs-B&H verdict. Conclusion: **the dashboard is a
+tape, not an allocator** — use it for regime context, exit discipline, and
+levels; do not auto-trade the BUY tiers, especially flat-state
+CONFIRMED/FLIP opens. No thresholds were changed on this result.
+
 ## Design notes / accepted tradeoffs
 
 - **Duration math is first-order only.** TLT% ≈ −D × Δyield (in percentage
