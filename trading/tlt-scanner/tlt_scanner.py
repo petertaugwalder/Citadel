@@ -12,7 +12,8 @@ Three-layer model:
                               light up as a downtrend actually reverses. Tiers: SCOUT >= 3,
                               CONFIRMED >= 5, REGIME FLIP = close over the 200-day.
   3. CROSS-CHECKS — futures/cash divergence, yield-exhaustion divergence, and the
-                commodity (DBA) inflation tape as a structural headwind flag.
+                commodity (DBA) tape as a coarse secondary inflation flag (ag
+                futures, not CPI).
   4. EXIT ENGINE — the sell signal, evaluated "as if long": trail breaks (21-EMA for
                 rentals/swings, 50-day once the regime flipped), a hard structure stop
                 (close under the prior 15-day low), trim-into-strength triggers, and
@@ -48,9 +49,9 @@ warnings.filterwarnings("ignore")
 
 TICKERS = {
     "TLT": "TLT",     # trade vehicle: 20+yr Treasury ETF — the only thing traded
-    "ZB": "ZB=F",     # 30y T-Bond futures: the leading tape
+    "ZB": "ZB=F",     # T-Bond futures: leading tape by hours (15-25y basket; UB is the tighter proxy)
     "TYX": "^TYX",    # 30y yield index (drives TLT, inverted)
-    "DBA": "DBA",     # ag/commodity tape: inflation-pressure flag
+    "DBA": "DBA",     # ag futures: coarse secondary inflation flag (not CPI)
 }
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
@@ -364,11 +365,11 @@ def macro_checks(frames: dict) -> list[str]:
         r = _last(dba, "roc20")
         if not np.isnan(r):
             if r > 4:
-                notes.append(f"Inflation tape: DBA +{r:.1f}%/20d — hot commodities pressure yields UP; cap bounce targets")
+                notes.append(f"Inflation tape (coarse, ags only): DBA +{r:.1f}%/20d — pressure on yields; cap bounce targets")
             elif r < -4:
-                notes.append(f"Inflation tape: DBA {r:.1f}%/20d — commodity disinflation is a TLT tailwind")
+                notes.append(f"Inflation tape (coarse, ags only): DBA {r:.1f}%/20d — commodity disinflation, a TLT tailwind")
             else:
-                notes.append(f"Inflation tape: DBA {r:+.1f}%/20d — neutral")
+                notes.append(f"Inflation tape (coarse, ags only): DBA {r:+.1f}%/20d — neutral")
     return notes
 
 
@@ -432,7 +433,8 @@ def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: 
 def exit_engine(frames: dict, res: dict, entry: float | None) -> dict:
     """The sell signal, evaluated as if long TLT. Mode-aware: rentals exit fast
     (21-EMA trail), a flipped regime gets room (50-day trail); the prior 15-day
-    low is the structure stop in every mode."""
+    low is the structure stop in every mode. Risk-management heuristics that
+    bound losses — not a validated edge."""
     tlt = frames["TLT"]
     zb, tyx = frames.get("ZB"), frames.get("TYX")
     close = _last(tlt, "Close")
@@ -775,15 +777,38 @@ def notify_macos(title: str, message: str) -> None:
 LOGIC = """
 THE LOGIC BEHIND THE SCANNER
 ============================
-What TLT is: packaged long-duration risk. Effective duration ~15-16, so
-  TLT %change ~= -16 x (change in long yields, in %). 30y +10bp => TLT ~ -1.6%.
-  You are not trading "bonds", you are trading the DIRECTION OF LONG YIELDS.
+What TLT is: packaged long-duration risk. First-order estimate:
+  TLT %change ~= -D x (change in long yields, in percentage points).
+  D is TLT's effective duration -- read it live from the issuer, it is NOT a
+  constant (it shifts with yield levels and coupon mix). Late-Aug 2026
+  BlackRock print: ~14.97 (mid-Aug ~14.8); use ~15 as the working multiplier.
+  Example: 30y 5.30% -> 5.19% is -11bp; at D=15 that's ~+1.65% (+1.76% at
+  D=16). First-order ONLY: convexity, curve twist, dividends, and NAV
+  premium/discount mean realized TLT will not match the estimate -- the
+  mid-Aug snapback mapped a ~15bp 30y drop to a ~2.2% duration estimate vs
+  ~+1.6% observed. Still: you are trading the DIRECTION OF LONG YIELDS.
 
-Why three instruments:
-  ^TYX (30y yield)  - the actual driver. TLT charts are just its mirror.
-  ZB futures        - trades ~23h/day, reacts to auctions, CPI, overnight macro
-                      FIRST. Futures lead the cash ETF; TLT gaps to catch up.
+Why three instruments (one market, three quotes):
+  Cash 30y yields, ZB futures, and TLT are three quotes of the same long-end
+  market, co-moving in overlapping hours -- not a strict causal chain. The
+  operational edge is HOURS: ZB trades the Globex session (Sun 5pm CT - Fri
+  4pm CT, 1h daily halt), so it discovers price while TLT is closed and TLT
+  often gaps at the cash open. Leadership is information timing, not a
+  separate economic cause.
+  ^TYX (30y yield)  - the cleanest single series to test trend and
+                      exhaustion on; the driver of TLT's value.
+  ZB futures        - the leading tape by hours, NOT a 1:1 TLT clone: the
+                      classic deliverable basket is 15-25y remaining
+                      maturity vs TLT's 20+y cash basket; basis, cheapest-
+                      to-deliver, and conversion factors keep them close,
+                      not identical. Ultra Bond (UB) is the tighter duration
+                      proxy if we ever swap; ZB earns its slot on liquidity
+                      and the 23h session.
   TLT               - what you can actually buy; where entries/stops live.
+
+Dropped on purpose: ^TNX and the 10s30s curve check. ^TYX is the better
+  single driver for TLT; the accepted cost is that we cannot distinguish
+  bear-steepeners from bull-flatteners. Do not silently re-add it.
 
 Layer 1 - REGIME (should you even be hunting longs?)
   Moving-average structure (price vs 50d/200d, 50d slope, 50d vs 200d) scored
@@ -808,9 +833,11 @@ Layer 3 - CROSS-CHECKS (is the signal honest?)
   * Bullish divergence on TLT lows / RSI - sellers exhausting.
   * Yield exhaustion: ^TYX higher high on weaker RSI - the uptrend in yields
     thinning out. Yield-down is the only durable TLT fuel.
-  * DBA / commodity tape: food & commodity inflation feeds breakevens ->
-    long yields. A hot ag tape (like Aug 2026) argues for renting bounces,
-    not marrying them.
+  * DBA / commodity tape: a COARSE secondary inflation flag, nothing more.
+    DBA is agriculture futures, not CPI -- food is one slice, and energy/
+    shelter/services drive most bond-relevant inflation. A DBA spike can be
+    weather or cocoa and say nothing about 30y term premium. A hot ag tape
+    argues for renting bounces rather than marrying them; weigh it lightly.
 
 Layer 4 - EXITS (the sell signal, evaluated "as if long"):
   EXIT    - close under the trail (21-EMA for rentals and swings, 50-day once
@@ -825,6 +852,9 @@ Layer 4 - EXITS (the sell signal, evaluated "as if long"):
   momentum crack; a confirmed trend gets room to breathe. Selling is a
   process like buying -- trim into strength, exit on the trail, and never
   argue with the structure stop.
+  These are risk-management heuristics, not a validated edge: the 15-day
+  lookback is arbitrary, and RSI>=70 will scratch you out of some squeezes
+  that keep running. They bound losses; they do not predict.
 
 Risk (non-negotiable):
   Stop = 15-day swing low minus 0.5 ATR. Size = (account x risk%) / (entry-stop).

@@ -64,8 +64,10 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
   exchange for better odds.
 
 **Layer 3 — CROSS-CHECKS**: TLT bullish RSI divergence, ^TYX yield-exhaustion
-divergence, ZB/TLT momentum disagreement (futures lead), and the DBA commodity
-tape as an inflation-pressure flag.
+divergence, ZB/TLT momentum disagreement (ZB leads by hours), and the DBA
+commodity tape as a **coarse secondary inflation flag** — DBA is agriculture
+futures, not CPI; food is one slice of bond-relevant inflation, and a DBA
+spike can be weather or cocoa saying nothing about 30y term premium.
 
 **Layer 4 — EXIT ENGINE** (the sell signal, evaluated "as if long"):
 **EXIT** on a close under the trail (21-EMA for rentals/swings, 50-day after a
@@ -77,6 +79,29 @@ EXIT/TRIM verdicts as well as BUYs.
 
 **Risk**: stop = 15-day swing low − 0.5×ATR; size = (account × risk%) ÷
 (entry − stop); targets = 50-day, then 200-day / +2R.
+
+## Design notes / accepted tradeoffs
+
+- **Duration math is first-order only.** TLT% ≈ −D × Δyield (in percentage
+  points), where D is TLT's *live* effective duration from the issuer — not a
+  constant; it shifts with yield levels and coupon mix (~15 as of late Aug
+  2026, per BlackRock ~14.97). Convexity, curve twist, dividends, and NAV
+  premium/discount mean realized moves won't match the estimate.
+- **One market, three quotes.** Cash 30y yields, ZB, and TLT co-move in
+  overlapping hours; there is no strict causal chain. ZB's edge is *hours*
+  (Globex Sun 5pm CT–Fri 4pm CT, 1h daily halt): it discovers price while TLT
+  is closed, so TLT often gaps at the cash open.
+- **ZB is not a 1:1 TLT clone.** Its classic deliverable basket is 15–25y
+  remaining maturity vs TLT's 20+y cash basket; basis, cheapest-to-deliver,
+  and conversion factors keep them close, not identical. Ultra Bond (UB) is
+  the tighter duration proxy if we ever swap; ZB stays for liquidity and the
+  23h session.
+- **^TNX / 10s30s dropped deliberately.** ^TYX is the better single driver
+  for TLT; the accepted cost is no bear-steepener vs bull-flattener
+  visibility.
+- **The exit rules are risk-management heuristics, not a validated edge.**
+  The 15-day lookback is arbitrary, and RSI ≥ 70 will scratch some squeezes
+  that keep running. They bound losses; they do not predict.
 
 ## Files
 
