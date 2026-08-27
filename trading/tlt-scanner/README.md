@@ -174,6 +174,39 @@ and 4.7× the average hold — the shape a call buyer needs. All modes still tra
 buy-and-hold, which is expected and **not the objective**: a call holder never
 collects the dividends that dominate that number.
 
+### SCHD calls: no validated edge (Schwab-based test, 2026-08)
+
+A separate backtest against **live Schwab price history** (3,734 sessions,
+2011-10-20 → 2026-08-27; price-only SCHD +318.29%, 10.11% CAGR, −33.37% maxDD;
+dividends excluded) tested 96 option-model variants with next-session fills,
+Schwab-observed spreads and $0.65/contract/side. **Verdict: no configuration
+stayed profitable across every sensitivity leg on completed campaigns.**
+
+- Best base result — 55-day breakout, 240 DTE, 0.65 delta, 200-day exit —
+  was **+$77.08 per initial contract over 17 closed campaigns**, but its
+  sensitivity range ran **−$122.58 to +$78.93**: it straddles zero.
+- Headline totals that looked stronger were dominated by a **still-open**
+  January 2026 campaign.
+- 20-day breakouts lost money on completed campaigns; **all 48 "50-day
+  reduces to half" variants lost money** — consistent with `reduce`
+  underperforming `trend` on the ETF path above.
+- 200-day-only exit was the least-bad structure, matching the `trend` default
+  here — but least-bad is not an edge.
+- **Measured liquidity: median qualifying spread 8.71%, p75 10.62%.** Two real
+  identical-contract replays returned −$1.30 and −$41.30 (far too small a
+  sample to infer from).
+- **Hard limitation:** real Schwab option history covered only four dates and
+  two distinct qualifying long-dated contracts, so a genuine multi-month
+  option backtest is impossible. The 96 variants are therefore *modelled*
+  option P&L over the ETF path, and the model's IV and spread assumptions
+  drive the result.
+
+Consequence for this repo: the `--options` panel is a **cost calculator, not a
+signal**. It labels the contract "NOT a recommendation", prints round-trip
+spread cost against the measured 8.71% median, and carries the no-edge notice.
+The 55-day breakout is *not* adopted here — picking the best of 96 variants on
+17 closed campaigns is parameter search, and its own sensitivity range says so.
+
 **Read all of the above as descriptive, not predictive** — the rules were
 written after seeing these tapes.
 

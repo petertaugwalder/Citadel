@@ -808,6 +808,8 @@ def render_schd_modes(res: dict) -> None:
 RISK_FREE = 0.045      # rough short rate for BS delta/theta; display-grade only
 SCHD_DIV_YIELD = 0.037  # ~SCHD trailing yield — a call holder forfeits this
 MIN_CALL_DTE = 150      # winners ran 70-110 sessions; give the thesis room past theta
+SCHD_SPREAD_MEDIAN = 8.71   # measured on Schwab, qualifying long-dated SCHD calls (2026-08)
+SCHD_SPREAD_P75 = 10.62     # 75th percentile of the same sample
 TARGET_DELTA = 0.70     # SCHD grinds — buy ITM leverage, not lottery tickets
 
 
@@ -907,7 +909,8 @@ def options_lines(opt: dict) -> list[str]:
         return [f"n/a — {opt['error']}"]
     src = opt.get("source", "?")
     lines = [
-        f"buy the {opt['expiry']} {opt['strike']:.0f} call  ({opt['dte']}d out, delta {opt['delta']:.2f})",
+        f"nearest qualifying contract: {opt['expiry']} {opt['strike']:.0f} call "
+        f"({opt['dte']}d out, delta {opt['delta']:.2f}) — NOT a recommendation",
         f"mid {opt['mid']:.2f}  (bid {opt['bid']:.2f} / ask {opt['ask']:.2f}"
         + (f", spread {opt['spread_pct']:.0f}% of mid)" if opt.get("spread_pct") is not None else ")"),
     ]
@@ -923,8 +926,16 @@ def options_lines(opt: dict) -> list[str]:
     if opt.get("div_forfeited_pct") is not None:
         theta_line += f"   dividends forfeited over the hold: ~{opt['div_forfeited_pct']:.1f}%"
     lines.append(theta_line)
+    sp = opt.get("spread_pct")
+    if sp is not None:
+        vs = ("wider than" if sp > SCHD_SPREAD_P75 else
+              "around" if sp >= SCHD_SPREAD_MEDIAN else "tighter than")
+        lines.append(f"round-trip spread cost ~{sp / 2:.1f}% of premium at mid, {sp:.1f}% crossing "
+                     f"— {vs} the {SCHD_SPREAD_MEDIAN:.1f}% median measured on Schwab")
     lines.append(f"source: {src}" + ("  (real greeks)" if src == "schwab"
                                      else "  (estimated greeks — run schwab_client.py login for real ones)"))
+    lines.append("NO VALIDATED EDGE: a Schwab-based option backtest (2026-08) found no configuration "
+                 "profitable across sensitivity legs. Use this for cost sizing, not as a signal.")
     return lines
 
 
