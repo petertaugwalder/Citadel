@@ -510,7 +510,7 @@ def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: 
         action, size, hold = "BUY — scout the turn", "1/3 size", "add at CONFIRMED (5/8), stop under swing low"
     elif bounce["active"]:
         action = "BUY — tactical bounce" if bounce["triggered_today"] else "HOLD bounce — manage"
-        size = "small (bear-regime rental)" if regime == "BEARISH" else "half size"
+        size = "small (bear-regime rental)" if regime == "BEARISH" else "1/3 size"
         hold = f"take profits into the 50/200-day band; exit on a close under the 21-EMA{e21_txt}"
     elif regime == "BEARISH":
         action, size, hold = "STAND ASIDE — bear regime, no trigger", "—", "wait for an oversold hook or 3/8 stack"
