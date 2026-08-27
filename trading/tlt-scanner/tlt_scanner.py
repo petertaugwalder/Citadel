@@ -42,12 +42,13 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 TICKERS = {
-    "TLT": "TLT",     # trade vehicle: 20+yr Treasury ETF
+    "TLT": "TLT",     # trade vehicle: 20+yr Treasury ETF — the only thing traded
     "ZB": "ZB=F",     # 30y T-Bond futures: the leading tape
     "TYX": "^TYX",    # 30y yield index (drives TLT, inverted)
-    "TNX": "^TNX",    # 10y yield (for the 10s30s curve)
+    "TNX": "^TNX",    # 10y yield — internal input for the 10s30s curve check only
     "DBA": "DBA",     # ag/commodity tape: inflation-pressure flag
 }
+HIDDEN_FROM_TAPE = {"TNX"}  # fetched for cross-checks, never shown as a watchlist row
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
 HISTORY_PERIOD = "2y"
@@ -393,16 +394,19 @@ def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: 
     tier = res["stack"]["tier"]
     bounce = res["bounce"]
     regime = res["regime"]["label"]
+    e21 = _last(tlt, "ema21")
+    e21_txt = f" ({e21:.2f})" if pd.notna(e21) else ""
+    s50_txt = f" ({s50:.2f})" if pd.notna(s50) else ""
     if tier == "REGIME FLIP":
-        action, size, hold = "BUY — regime flip", "full size", "position trade: trail the 50-day"
+        action, size, hold = "BUY — regime flip", "full size", f"position trade: trail the 50-day{s50_txt}"
     elif tier == "CONFIRMED":
-        action, size, hold = "BUY — trend turn confirmed", "2/3 size, add over 200-day", "swing→position: trail the 21-EMA"
+        action, size, hold = "BUY — trend turn confirmed", "2/3 size, add over 200-day", f"swing→position: trail the 21-EMA{e21_txt}"
     elif tier == "SCOUT":
         action, size, hold = "BUY — scout the turn", "1/3 size", "add at CONFIRMED (5/8), stop under swing low"
     elif bounce["active"]:
         action = "BUY — tactical bounce" if bounce["triggered_today"] else "HOLD bounce — manage"
         size = "small (bear-regime rental)" if regime == "BEARISH" else "half size"
-        hold = "take profits into the 50/200-day band; exit on a close under the 21-EMA"
+        hold = f"take profits into the 50/200-day band; exit on a close under the 21-EMA{e21_txt}"
     elif regime == "BEARISH":
         action, size, hold = "STAND ASIDE — bear regime, no trigger", "—", "wait for an oversold hook or 3/8 stack"
     else:
@@ -451,6 +455,8 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0) -
     lit, tier = stack_tier(items, frames.get("TLT"))
     res["stack"] = {"items": items, "lit": lit, "of": len(items), "tier": tier}
     for name, df in frames.items():
+        if name in HIDDEN_FROM_TAPE:
+            continue
         res["tape"][name] = {
             "close": round(_last(df, "Close"), 3),
             "chg1": round(_last(df, "chg1"), 2),

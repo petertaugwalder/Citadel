@@ -2,6 +2,8 @@
 
 Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 **ZB futures** (30y T-Bond) and the **30y yield (^TYX)** as confirming tape.
+TLT is the only trade vehicle; ^TNX (10y) is fetched silently just to compute
+the 10s30s curve cross-check and never shown on the tape.
 Daily (end-of-day) data from Yahoo Finance, cached locally. Built for iTerm —
 rich TUI dashboard with a plain-ANSI fallback.
 
