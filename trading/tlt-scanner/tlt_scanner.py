@@ -251,15 +251,23 @@ def demo_frames() -> dict[str, pd.DataFrame]:
     return out
 
 
-def fetch_duration() -> tuple[float, bool]:
-    """TLT effective duration: (value, is_live). Live from Yahoo fund data when
-    possible (cached 7 days); otherwise the 15.0 fallback, marked STALE."""
+def fetch_duration(refresh: bool = False) -> tuple[float, bool, str, str | None]:
+    """Return a dated TLT effective duration without inventing a fallback.
+
+    Only a value fetched during this scan is allowed to drive duration-implied
+    P&L. A dated cache may still be displayed for context, but is marked stale
+    and deliberately returns ``is_live=False``.
+    """
     cache = CACHE_DIR / "duration.json"
     try:
-        if cache.exists() and (time.time() - cache.stat().st_mtime) < 7 * 86400:
-            d = float(json.loads(cache.read_text())["d"])
+        if cache.exists() and not refresh and (time.time() - cache.stat().st_mtime) < 7 * 86400:
+            payload = json.loads(cache.read_text())
+            d = float(payload["d"])
             if 5 < d < 30:
-                return d, True
+                as_of = payload.get("as_of") or time.strftime(
+                    "%Y-%m-%d", time.localtime(cache.stat().st_mtime)
+                )
+                return d, False, "cached fund data — STALE", as_of
     except Exception:
         pass
     try:
@@ -279,11 +287,12 @@ def fetch_duration() -> tuple[float, bool]:
                 d = float(v)
                 if 5 < d < 30:
                     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    cache.write_text(json.dumps({"d": d}))
-                    return d, True
+                    as_of = pd.Timestamp.now(tz="UTC").date().isoformat()
+                    cache.write_text(json.dumps({"d": d, "as_of": as_of}))
+                    return d, True, "live fund data", as_of
     except Exception:
         pass
-    return 15.0, False
+    return float("nan"), False, "no current or dated cached TLT effective duration", None
 
 
 # ----------------------------------------------------------------------------- analysis
@@ -424,18 +433,22 @@ def divergences(frames: dict) -> list[str]:
     return notes
 
 
-def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
+def aux_metrics(frames: dict, duration: tuple) -> dict:
     """Derived inputs for the TLT leg only (duration, residual, curve). Display /
     CAUTION material — no buy/sell booleans, no EXIT rules. SCHD never appears
     here: the two legs are independent trades and share no state."""
-    d_val, d_live = duration
+    d_val, d_live = duration[:2]
+    d_source = duration[2] if len(duration) > 2 else ("live source" if d_live else "undated fallback — STALE")
+    d_as_of = duration[3] if len(duration) > 3 else None
     tlt, tyx, tnx = frames.get("TLT"), frames.get("TYX"), frames.get("TNX")
-    out: dict = {"duration": {"D": round(d_val, 2), "live": bool(d_live)}}
-    if tyx is not None and len(tyx) >= 2:
+    out: dict = {"duration": {
+        "D": round(d_val, 2), "live": bool(d_live), "source": d_source, "as_of": d_as_of,
+    }}
+    if d_live and math.isfinite(d_val) and tyx is not None and len(tyx) >= 2:
         dy_bp = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-2]) * 100
         out["duration"]["today_dy_bp"] = round(dy_bp, 1)
         out["duration"]["implied_1d_pct"] = round(-d_val * dy_bp / 100, 2)
-    if tlt is not None and tyx is not None and len(tyx) >= 6 and len(tlt) >= 6:
+    if d_live and math.isfinite(d_val) and tlt is not None and tyx is not None and len(tyx) >= 6 and len(tlt) >= 6:
         dy5 = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-6])
         implied5 = -d_val * dy5
         actual5 = float(tlt["Close"].iloc[-1] / tlt["Close"].iloc[-6] - 1) * 100
@@ -457,8 +470,11 @@ def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
 def macro_checks(frames: dict, aux: dict) -> list[str]:
     notes = []
     d = aux["duration"]
-    tag = " (live, weekly cache)" if d["live"] else " (fallback 15.0 — STALE)"
-    line = f"Duration: D≈{d['D']:.2f}{tag}"
+    if not math.isfinite(d["D"]):
+        line = f"Duration: UNAVAILABLE ({d.get('source', 'no usable source')})"
+    else:
+        dated = f"; as of {d['as_of']}" if d.get("as_of") else ""
+        line = f"Duration: D≈{d['D']:.2f} ({d.get('source', 'unknown source')}{dated})"
     if "today_dy_bp" in d:
         line += f" | today Δy {d['today_dy_bp']:+.0f}bp → ~{d['implied_1d_pct']:+.2f}% first-order"
     notes.append(line)
@@ -2134,7 +2150,8 @@ def main() -> int:
         if "TLT" not in frames:
             print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
             return None, None
-        dur = (15.0, False) if args.demo else fetch_duration()
+        dur = ((float("nan"), False, "demo data has no effective duration", None)
+               if args.demo else fetch_duration(refresh=force))
         res = analyze(frames, account=args.account, risk_pct=args.risk, entry=args.entry, duration=dur,
                       schd_entry=args.schd_entry, schd_exit=args.schd_exit or "trend")
         if args.allocate:
