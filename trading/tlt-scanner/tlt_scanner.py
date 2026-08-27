@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
@@ -145,7 +146,7 @@ def to_32nds(x: float) -> str:
 # ----------------------------------------------------------------------------- data layer
 
 
-def fetch_yahoo(symbol: str) -> pd.DataFrame | None:
+def fetch_yahoo(symbol: str, auto_adjust: bool = True) -> pd.DataFrame | None:
     import logging
 
     import yfinance as yf
@@ -153,9 +154,9 @@ def fetch_yahoo(symbol: str) -> pd.DataFrame | None:
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     try:
         df = yf.download(symbol, period=HISTORY_PERIOD, interval="1d",
-                         auto_adjust=True, progress=False, threads=False)
+                         auto_adjust=auto_adjust, progress=False, threads=False)
         if df is None or df.empty:
-            df = yf.Ticker(symbol).history(period=HISTORY_PERIOD, interval="1d", auto_adjust=True)
+            df = yf.Ticker(symbol).history(period=HISTORY_PERIOD, interval="1d", auto_adjust=auto_adjust)
     except Exception as exc:  # network / proxy / API failures degrade per-ticker
         print(f"  ! fetch failed for {symbol}: {exc}", file=sys.stderr)
         return None
@@ -191,6 +192,19 @@ def load_frames(refresh: bool = False) -> dict[str, pd.DataFrame]:
                 df = pd.read_csv(cache, index_col=0, parse_dates=True)
         if df is not None and len(df) >= 60:
             frames[name] = enrich(df)
+    # SCHD unadjusted: the price-only series a call buyer actually tracks (no dividends)
+    px_cache = CACHE_DIR / "SCHD_PX.csv"
+    px = None
+    if px_cache.exists() and not refresh and (time.time() - px_cache.stat().st_mtime) < CACHE_TTL_SEC:
+        px = pd.read_csv(px_cache, index_col=0, parse_dates=True)
+    if px is None or px.empty:
+        px = fetch_yahoo("SCHD", auto_adjust=False)
+        if px is not None:
+            px.to_csv(px_cache)
+        elif px_cache.exists():
+            px = pd.read_csv(px_cache, index_col=0, parse_dates=True)
+    if px is not None and len(px) >= 60:
+        frames["SCHD_PX"] = enrich(px)
     return frames
 
 
@@ -229,7 +243,12 @@ def demo_frames() -> dict[str, pd.DataFrame]:
         "TNX": (3.90, [(0.55, 0.13), (0.25, 0.03), (0.17, 0.032), (0.03, -0.012)], 0.0060),
         "SCHD": (26.0, [(0.55, 0.06), (0.25, -0.04), (0.20, 0.09)], 0.0070),
     }
-    return {k: enrich(_demo_walk(rng, n, s, seg, v)) for k, (s, seg, v) in shapes.items()}
+    out = {k: enrich(_demo_walk(rng, n, s, seg, v)) for k, (s, seg, v) in shapes.items()}
+    if "SCHD" in out:  # synthetic price-only series: same path less the dividend drift
+        px = out["SCHD"][["Open", "High", "Low", "Close"]].copy()
+        drag = np.exp(-SCHD_DIV_YIELD * np.arange(len(px)) / 252)
+        out["SCHD_PX"] = enrich(px.mul(drag, axis=0))
+    return out
 
 
 def fetch_duration() -> tuple[float, bool]:
@@ -544,8 +563,19 @@ def schd_engine(frames: dict, account: float | None = None, risk_pct: float = 1.
     return out
 
 
-def backtest_schd(frames: dict, cost_bps: float = 1.0, start: str | None = None) -> dict:
-    """Replay the SCHD rules: binary 1.0/0, signals on close T, fills at open T+1."""
+SCHD_VARIANTS = {
+    1: "all entries, 50d/200d exits (original)",
+    2: "breakout entries only, 50d/200d exits",
+    3: "all entries, 200d exit only",
+    4: "breakout only + 200d exit only (call-buyer shape)",
+}
+
+
+def backtest_schd(frames: dict, cost_bps: float = 1.0, start: str | None = None,
+                  entries: str = "all", exit_50: bool = True) -> dict:
+    """Replay the SCHD rules: binary 1.0/0, signals on close T, fills at open T+1.
+    entries: 'all' (pullback + breakout) or 'breakout'. exit_50: honour the 50-day
+    reduce-level as a full exit (True) or hold to the 200-day trend break (False)."""
     st = schd_state(frames)
     if st.empty:
         return {"error": "no SCHD data"}
@@ -577,10 +607,12 @@ def backtest_schd(frames: dict, cost_bps: float = 1.0, start: str | None = None)
                 rets[i] = weight * (c / c_prev - 1)
         weights[i] = weight
         row = st.iloc[i]
+        entry_ok = bool(row["breakout"]) if entries == "breakout" else bool(row["entry_sig"])
+        exit_ok = bool(row["exit_hard"]) or (exit_50 and bool(row["exit_swing"]))
         if weight == 0:
-            if bool(row["entry_sig"]) and not bool(row["exit_sig"]):
+            if entry_ok and not exit_ok:
                 pending = (1.0, "BREAKOUT" if bool(row["breakout"]) else "PULLBACK")
-        elif bool(row["exit_sig"]):
+        elif exit_ok:
             pending = (0.0, "HARD" if bool(row["exit_hard"]) else "SWING")
 
     equity = np.cumprod(1 + rets)
@@ -606,10 +638,29 @@ def backtest_schd(frames: dict, cost_bps: float = 1.0, start: str | None = None)
         sd = x.std()
         return float(x.mean() / sd * np.sqrt(252)) if sd > 0 else 0.0
 
+    px = frames.get("SCHD_PX")
+    bh_price = None
+    if px is not None:
+        pxc = px["Close"].reindex(st.index).ffill().dropna()
+        if len(pxc) > 1:
+            bh_price = round(float(pxc.iloc[-1] / pxc.iloc[0] - 1) * 100, 2)
+
+    holds = [e["days"] for e in closed]
+    long_holds = [e for e in closed if e["days"] >= 60]
+    pnl_all = sum(e["pnl_pct"] for e in closed)
     years = n / 252
     return {
         "summary": {
             "instrument": "SCHD",
+            "entries": entries,
+            "exit_50d": exit_50,
+            "holds": {
+                "median_days": int(np.median(holds)) if holds else None,
+                "pct_trades_under_10d": round(sum(1 for h in holds if h < 10) / len(holds) * 100, 1) if holds else None,
+                "trades_60d_plus": len(long_holds),
+                "pnl_share_from_60d_plus_pct": round(sum(e["pnl_pct"] for e in long_holds) / pnl_all * 100, 1)
+                if pnl_all else None,
+            },
             "window": f"{st.index[0].date()} → {st.index[-1].date()}",
             "sessions": n, "cost_bps_per_side": cost_bps,
             "strategy": {
@@ -625,6 +676,7 @@ def backtest_schd(frames: dict, cost_bps: float = 1.0, start: str | None = None)
                 "max_drawdown_pct": round(max_dd(bh), 2),
                 "sharpe": round(sharpe(bh_ret), 2),
             },
+            "buy_and_hold_schd_price_only": bh_price,
             "trades": {
                 "closed": len(closed), "open_at_end": 1 if ep is not None else 0,
                 "win_rate_pct": round(len(wins) / len(closed) * 100, 1) if closed else None,
@@ -640,8 +692,166 @@ def backtest_schd(frames: dict, cost_bps: float = 1.0, start: str | None = None)
             "signals on close T, fills at open T+1; no intraday stops",
             f"costs {cost_bps} bps per side; no taxes; dividend-adjusted prices both sides",
             "SCHD is an income vehicle: compare hard against buy-and-hold before trading it",
+            "SHARES, not calls: a -0.5% share scratch is roughly -15/-25% on a 30-delta call "
+            "after spread and theta, so short holds are far more punishing than these numbers show",
+            "price-only B&H is the honest benchmark for a call buyer — calls forfeit the dividend",
         ],
     }
+
+
+def run_schd_ablation(frames: dict, start: str | None = None) -> dict:
+    """The four SCHD entry/exit combinations at 1bp and 5bp on one window."""
+    combos = {1: ("all", True), 2: ("breakout", True), 3: ("all", False), 4: ("breakout", False)}
+    rows, window, bh, bh_px = [], None, None, None
+    for v, (entries, exit_50) in combos.items():
+        for cost in (1.0, 5.0):
+            r = backtest_schd(frames, cost_bps=cost, start=start, entries=entries, exit_50=exit_50)
+            if "error" in r:
+                return r
+            sm = r["summary"]
+            window, bh = sm["window"], sm["buy_and_hold_schd"]
+            bh_px = sm.get("buy_and_hold_schd_price_only")
+            rows.append({
+                "variant": v, "name": SCHD_VARIANTS[v], "cost_bps": cost,
+                "trades": sm["trades"]["closed"] + sm["trades"]["open_at_end"],
+                "win_rate_pct": sm["trades"]["win_rate_pct"],
+                "profit_factor": sm["trades"]["profit_factor"],
+                "median_hold_days": sm["holds"]["median_days"],
+                "pct_under_10d": sm["holds"]["pct_trades_under_10d"],
+                "total_return_pct": sm["strategy"]["total_return_pct"],
+                "vs_bh_total_pct": round(sm["strategy"]["total_return_pct"] - bh["total_return_pct"], 2),
+                "vs_bh_price_pct": round(sm["strategy"]["total_return_pct"] - bh_px, 2) if bh_px is not None else None,
+                "max_drawdown_pct": sm["strategy"]["max_drawdown_pct"],
+                "time_in_market_pct": sm["strategy"]["exposure_pct"],
+            })
+    return {"window": window, "buy_and_hold_schd": bh, "buy_and_hold_schd_price_only": bh_px, "rows": rows}
+
+
+def render_schd_ablation(res: dict) -> None:
+    if "error" in res:
+        print(f"schd ablation: {res['error']}", file=sys.stderr)
+        return
+    bh = res["buy_and_hold_schd"]
+    px = res["buy_and_hold_schd_price_only"]
+    px_txt = f"   price-only B&H {px:+.2f}%" if px is not None else "   price-only B&H n/a"
+    print(f"\n{BOLD}SCHD ABLATION{END}  window {res['window']}   "
+          f"B&H total-return {bh['total_return_pct']:+.2f}% (maxDD {bh['max_drawdown_pct']:.2f}%){px_txt}")
+    print("=" * 108)
+    hdr = (f"  {'#':>1} {'variant':<40} {'bps':>4} {'trades':>6} {'WR%':>5} {'PF':>5} "
+           f"{'medHold':>7} {'<10d%':>6} {'total%':>8} {'vsTR':>8} {'vsPX':>8} {'maxDD%':>7} {'TIM%':>6}")
+    print(DIM + hdr + END)
+    for r in res["rows"]:
+        wr = f"{r['win_rate_pct']:.1f}" if r["win_rate_pct"] is not None else "—"
+        pf = f"{r['profit_factor']:.2f}" if r["profit_factor"] is not None else "—"
+        mh = f"{r['median_hold_days']}" if r["median_hold_days"] is not None else "—"
+        u10 = f"{r['pct_under_10d']:.0f}" if r["pct_under_10d"] is not None else "—"
+        vpx = f"{r['vs_bh_price_pct']:>+8.2f}" if r["vs_bh_price_pct"] is not None else f"{'—':>8}"
+        col = GREEN if (r["vs_bh_price_pct"] or -1) > 0 else RED
+        print(f"  {r['variant']} {r['name']:<40.40} {r['cost_bps']:>4.1f} {r['trades']:>6} {wr:>5} {pf:>5} "
+              f"{mh:>7} {u10:>6} {r['total_return_pct']:>+8.2f} {r['vs_bh_total_pct']:>+8.2f} "
+              f"{col}{vpx}{END} {r['max_drawdown_pct']:>7.2f} {r['time_in_market_pct']:>6.1f}")
+    print(f"\n  {DIM}vsTR = vs dividend-adjusted B&H (shareholder). vsPX = vs price-only B&H — "
+          f"the honest bar for a CALL buyer, who gets no dividends.\n"
+          f"  Share-based: short holds cost far more on calls than shown. All variants in-sample.{END}\n")
+
+
+# ----------------------------------------------------------------------------- SCHD options (call buyer)
+
+RISK_FREE = 0.045      # rough short rate for BS delta/theta; display-grade only
+SCHD_DIV_YIELD = 0.037  # ~SCHD trailing yield — a call holder forfeits this
+MIN_CALL_DTE = 150      # winners ran 70-110 sessions; give the thesis room past theta
+TARGET_DELTA = 0.70     # SCHD grinds — buy ITM leverage, not lottery tickets
+
+
+def _nd(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_call(S, K, T, sigma, r=RISK_FREE, q=SCHD_DIV_YIELD):
+    """(delta, theta_per_day) for a European call. Display-grade, not a pricing engine."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return float("nan"), float("nan")
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    delta = math.exp(-q * T) * _nd(d1)
+    pdf = math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi)
+    theta = (-S * pdf * sigma * math.exp(-q * T) / (2 * math.sqrt(T))
+             - r * K * math.exp(-r * T) * _nd(d2)
+             + q * S * math.exp(-q * T) * _nd(d1))
+    return delta, theta / 365.0
+
+
+def schd_options(spot: float, min_dte: int = MIN_CALL_DTE, target_delta: float = TARGET_DELTA) -> dict:
+    """Live SCHD call chain: pick an expiry with room to run and a strike near the
+    target delta. Never fatal — returns {'error': ...} if the chain is unavailable."""
+    try:
+        import logging
+
+        import yfinance as yf
+
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        tk = yf.Ticker("SCHD")
+        expiries = list(tk.options or [])
+        if not expiries:
+            return {"error": "no SCHD option expiries returned"}
+        today = pd.Timestamp.today().normalize()
+        dated = [(e, (pd.Timestamp(e) - today).days) for e in expiries]
+        eligible = [(e, d) for e, d in dated if d >= min_dte] or [max(dated, key=lambda x: x[1])]
+        expiry, dte = eligible[0]
+        calls = tk.option_chain(expiry).calls
+        if calls is None or calls.empty:
+            return {"error": f"empty call chain for {expiry}"}
+        c = calls.copy()
+        c["mid"] = (c["bid"].fillna(0) + c["ask"].fillna(0)) / 2
+        c = c[(c["mid"] > 0) & (c["impliedVolatility"] > 0)]
+        if c.empty:
+            return {"error": f"no two-sided quotes for {expiry}"}
+        T = max(dte, 1) / 365.0
+        atm = c.iloc[(c["strike"] - spot).abs().argsort()].iloc[0]
+        atm_iv = float(atm["impliedVolatility"])
+        rows = []
+        for _, r in c.iterrows():
+            iv = float(r["impliedVolatility"])
+            delta, theta_day = _bs_call(spot, float(r["strike"]), T, iv)
+            if math.isnan(delta):
+                continue
+            bid, ask, mid = float(r["bid"] or 0), float(r["ask"] or 0), float(r["mid"])
+            rows.append({"strike": float(r["strike"]), "mid": mid, "bid": bid, "ask": ask,
+                         "iv": iv, "delta": delta, "theta_day": theta_day,
+                         "spread_pct": (ask - bid) / mid * 100 if mid > 0 else float("nan")})
+        if not rows:
+            return {"error": "could not price any strikes"}
+        pick = min(rows, key=lambda r: abs(r["delta"] - target_delta))
+        return {
+            "expiry": expiry, "dte": dte, "spot": round(spot, 2),
+            "atm_iv_pct": round(atm_iv * 100, 1),
+            "strike": pick["strike"], "mid": round(pick["mid"], 2),
+            "bid": round(pick["bid"], 2), "ask": round(pick["ask"], 2),
+            "spread_pct": round(pick["spread_pct"], 1) if not math.isnan(pick["spread_pct"]) else None,
+            "delta": round(pick["delta"], 2),
+            "theta_day": round(pick["theta_day"], 4),
+            "theta_pct_of_premium_per_day": round(abs(pick["theta_day"]) / pick["mid"] * 100, 2) if pick["mid"] else None,
+            "breakeven": round(pick["strike"] + pick["mid"], 2),
+            "breakeven_move_pct": round((pick["strike"] + pick["mid"] - spot) / spot * 100, 2),
+            "premium_pct_of_notional": round(pick["mid"] / spot * 100, 1),
+            "div_forfeited_pct": round(SCHD_DIV_YIELD * dte / 365 * 100, 2),
+        }
+    except Exception as exc:
+        return {"error": f"option chain unavailable ({type(exc).__name__})"}
+
+
+def options_lines(opt: dict) -> list[str]:
+    if "error" in opt:
+        return [f"n/a — {opt['error']}"]
+    return [
+        f"buy the {opt['expiry']} {opt['strike']:.0f} call  ({opt['dte']}d out, delta {opt['delta']:.2f})",
+        f"mid {opt['mid']:.2f}  (bid {opt['bid']:.2f} / ask {opt['ask']:.2f}"
+        + (f", spread {opt['spread_pct']:.0f}% of mid)" if opt["spread_pct"] is not None else ")"),
+        f"ATM IV {opt['atm_iv_pct']:.1f}%   premium {opt['premium_pct_of_notional']:.1f}% of notional",
+        f"breakeven {opt['breakeven']:.2f} (+{opt['breakeven_move_pct']:.1f}% move needed)",
+        f"theta ~{opt['theta_pct_of_premium_per_day']:.2f}% of premium/day   "
+        f"dividends forfeited over the hold: ~{opt['div_forfeited_pct']:.1f}%",
+    ]
 
 
 def schd_lines(engine: dict) -> list[str]:
@@ -1307,6 +1517,11 @@ def render_plain(res: dict, demo: bool) -> None:
             print(f"  [{paint(g['on'], 'x', ' ')}] trend gate: {g['name']}")
     for i, line in enumerate(schd_lines(sc)):
         print(f"  {sc_col}{BOLD}{line}{END}" if i == 0 else f"  {line}")
+    opt = res.get("options")
+    if opt is not None:
+        print(f"\n{BOLD}SCHD CALLS{END}  {DIM}(sized to the signal's hold; calls forfeit the dividend){END}")
+        for line in options_lines(opt):
+            print(f"  * {line}")
     print(f"\n{BOLD}WHAT FLIPS IT{END}")
     for f in p["what_flips_it"]:
         print(f"  -> {f}")
@@ -1440,6 +1655,13 @@ def render_rich(res: dict, demo: bool) -> None:
     sc_group.append(body)
     console.print(Panel(Group(*sc_group), title="SCHD — equity leg",
                         border_style="red" if sc.get("action", "").startswith("EXIT") else "blue"))
+    opt = res.get("options")
+    if opt is not None:
+        opt_t = Text()
+        for i, line in enumerate(options_lines(opt)):
+            opt_t.append(f"{line}\n", style="bold" if i == 0 else None)
+        opt_t.append("sized to the signal's hold; calls forfeit the dividend", style="dim")
+        console.print(Panel(opt_t, title="SCHD calls", border_style="magenta"))
     alloc = res.get("allocator")
     if alloc is not None and "error" not in alloc:
         a_t = Table(box=None, pad_edge=False, show_header=False)
@@ -1558,9 +1780,26 @@ THE SCHD LEG (traded, separate engine):
   RISK: stop = 20-day swing low - 0.5 ATR (wider than TLT's 15-day, because
     equity trends breathe more); size = (account x risk%) / (entry - stop);
     first target +2R. --schd-entry adds open P&L and R-multiple.
-  Backtest it with --backtest --schd (vs SCHD buy-and-hold). SCHD is an
-  income vehicle: dividends compound for holders, so beating buy-and-hold is
-  the bar, and the in-sample caveat applies exactly as it does to TLT.
+  Backtest it with --backtest --schd, and compare entry/exit families with
+  --backtest --schd --ablate (4 variants x 1bp/5bp). SCHD is an income
+  vehicle: dividends compound for holders, so beating buy-and-hold is the
+  bar, and the in-sample caveat applies exactly as it does to TLT.
+
+BUYING SCHD CALLS (--options):
+  A call holder captures the PRICE leg only -- SCHD's ~3.7% dividend accrues
+  to shareholders and is already discounted into the forward, so the honest
+  benchmark is price-only buy-and-hold (printed as vsPX in the ablation),
+  not the dividend-adjusted number.
+  Consequences the share backtest understates: a -0.5% share scratch is
+  roughly -15/-25% on a 30-delta call once spread and theta are paid, so the
+  churn variants are far worse for calls than the tables show; and SCHD's
+  option book is thin, so spreads matter.
+  The panel therefore picks an expiry at least MIN_CALL_DTE days out (the
+  winning holds ran 70-110 sessions) and a strike near delta 0.70 -- SCHD
+  grinds, so buy ITM leverage rather than cheap OTM. It prints ATM IV,
+  premium as % of notional, breakeven and the move required, theta as % of
+  premium per day, and the dividends forfeited over the hold. Greeks are
+  Black-Scholes with r=4.5% and q=3.7%: display-grade, not a pricing engine.
 
 Layer 4 - EXITS (the sell signal, evaluated "as if long"):
   EXIT    - close under the trail (21-EMA for rentals and swings, 50-day once
@@ -1635,6 +1874,14 @@ def main() -> int:
     ap.add_argument("--entry", type=float, help="your TLT entry price — adds open P&L and R-multiple to the exit engine")
     ap.add_argument("--schd-entry", type=float, help="your SCHD entry price — adds open P&L and R-multiple to the SCHD leg")
     ap.add_argument("--schd", action="store_true", help="with --backtest/--ablate: run the SCHD leg instead of TLT")
+    ap.add_argument("--options", action="store_true",
+                    help="add the SCHD call panel (live chain: expiry, strike, IV, theta, breakeven)")
+    ap.add_argument("--min-dte", type=int, default=MIN_CALL_DTE, help=f"minimum days to expiry (default {MIN_CALL_DTE})")
+    ap.add_argument("--target-delta", type=float, default=TARGET_DELTA, help=f"target call delta (default {TARGET_DELTA})")
+    ap.add_argument("--schd-entries", choices=("all", "breakout"), default="all",
+                    help="with --backtest --schd: entry family (default all)")
+    ap.add_argument("--no-50d-exit", action="store_true",
+                    help="with --backtest --schd: hold to the 200-day instead of exiting at the 50-day")
     ap.add_argument("--backtest", action="store_true", help="replay the buy/sell rules bar-by-bar over the full history")
     ap.add_argument("--cost-bps", type=float, default=1.0, help="backtest cost per side in bps (default 1.0)")
     ap.add_argument("--allocate", action="store_true",
@@ -1657,8 +1904,12 @@ def main() -> int:
             return 1
         if args.demo and not args.json:
             print(f"\n{YEL}{BOLD}[DEMO DATA — synthetic tape, results validate the pipeline, not the strategy]{END}")
-        if args.schd:
-            res = backtest_schd(frames, cost_bps=args.cost_bps, start=args.from_date)
+        if args.schd and args.ablate:
+            res = run_schd_ablation(frames, start=args.from_date)
+            print(json.dumps(res, indent=2, default=str)) if args.json else render_schd_ablation(res)
+        elif args.schd:
+            res = backtest_schd(frames, cost_bps=args.cost_bps, start=args.from_date,
+                                entries=args.schd_entries, exit_50=not args.no_50d_exit)
             print(json.dumps(res, indent=2, default=str)) if args.json else render_backtest(res)
         elif args.ablate:
             res = run_ablation(frames, start=args.from_date)
@@ -1681,6 +1932,9 @@ def main() -> int:
                       schd_entry=args.schd_entry)
         if args.allocate:
             res["allocator"] = allocator_snapshot(frames)
+        if args.options and "error" not in res["schd"]:
+            res["options"] = schd_options(res["schd"]["close"], min_dte=args.min_dte,
+                                          target_delta=args.target_delta)
         action, exitv = res["plan"]["action"], res["exit"]["verdict"]
         if args.history:
             df = history_frame(frames, args.history)

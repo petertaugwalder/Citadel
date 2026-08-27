@@ -37,7 +37,9 @@ python tlt_scanner.py --explain   # the trading logic, in the terminal
 | `python tlt_scanner.py --ablate --from 2020-01-01` | 4-variant ablation (current / no-SCOUT / no-trail / allocator) at 1bp and 5bp; `--from` sets the window start |
 | `python tlt_scanner.py --watch 900 --notify` | Re-scan every 15 min, macOS notification on a new BUY |
 | `python tlt_scanner.py --account 50000 --risk 1.0` | Adds position sizing (risk 1% of $50k per trade) |
-| `python tlt_scanner.py --backtest --schd` | Backtest the SCHD leg against SCHD buy-and-hold |
+| `python tlt_scanner.py --backtest --schd` | Backtest the SCHD leg against SCHD buy-and-hold (total-return and price-only) |
+| `python tlt_scanner.py --backtest --schd --ablate` | 4 SCHD entry/exit variants × 1bp/5bp, with `vsPX` — the call-buyer's benchmark |
+| `python tlt_scanner.py --options` | SCHD call panel: expiry, strike, IV, delta, theta, breakeven, dividends forfeited |
 | `python tlt_scanner.py --schd-entry 28.50` | Adds open P&L and R-multiple to the SCHD leg |
 | `python tlt_scanner.py --entry 82.50` | Adds open P&L and R-multiple to the exit engine, plus a stop-to-breakeven suggestion past +1R |
 | `python tlt_scanner.py --json` | Machine-readable output for piping |
@@ -97,9 +99,26 @@ the two engines, in either direction.
 - **Risk**: stop = 20-day swing low − 0.5×ATR; size = (account × risk%) ÷
   (entry − stop); first target +2R. `--schd-entry 28.50` adds open P&L and
   R-multiple.
-- **Backtest**: `--backtest --schd` (compared against SCHD buy-and-hold).
-  SCHD's dividends compound for holders, so beating buy-and-hold is the bar —
-  and the in-sample caveat applies exactly as it does to TLT.
+- **Backtest**: `--backtest --schd`; compare entry/exit families with
+  `--backtest --schd --ablate` (4 variants × 1bp/5bp). The in-sample caveat
+  applies exactly as it does to TLT.
+
+## Buying SCHD calls (`--options`)
+
+A call holder captures the **price leg only** — SCHD's ~3.7% dividend accrues
+to shareholders and is already discounted into the forward. So the honest
+benchmark is **price-only buy-and-hold** (the `vsPX` column in the ablation),
+not the dividend-adjusted number, and the share backtest *understates* churn
+costs badly: a −0.5% share scratch is roughly −15/−25% on a 30-delta call once
+spread and theta are paid. SCHD's option book is also thin, so spreads matter.
+
+`--options` therefore picks an expiry at least `--min-dte` days out (default
+150 — the winning holds ran 70–110 sessions) and a strike near
+`--target-delta` (default 0.70; SCHD grinds, so ITM leverage beats cheap OTM).
+It prints ATM IV, premium as % of notional, breakeven and the move required,
+theta as % of premium per day, and the dividends forfeited over the hold.
+Greeks are Black-Scholes (r=4.5%, q=3.7%) — display-grade, not a pricing
+engine.
 
 **Layer 4 — EXIT ENGINE** (the sell signal, evaluated "as if long"):
 **EXIT** on a close under the trail (21-EMA for rentals/swings, 50-day after a
@@ -177,3 +196,4 @@ and 5bp on the same window; every variant is in-sample.
 - ZB removed, UB only.
 - DBA and DBC removed; SCHD added display-only.
 - SCHD promoted to a traded leg with its own trend engine and backtest.
+- SCHD ablation (4 entry/exit variants), price-only benchmark, and a call-buyer options panel.
