@@ -2,8 +2,7 @@
 
 Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 **ZB futures** (30y T-Bond) and the **30y yield (^TYX)** as confirming tape.
-TLT is the only trade vehicle; ^TNX (10y) is fetched silently just to compute
-the 10s30s curve cross-check and never shown on the tape.
+TLT is the only trade vehicle.
 Daily (end-of-day) data from Yahoo Finance, cached locally. Built for iTerm —
 rich TUI dashboard with a plain-ANSI fallback.
 
@@ -64,9 +63,8 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
   exchange for better odds.
 
 **Layer 3 — CROSS-CHECKS**: TLT bullish RSI divergence, ^TYX yield-exhaustion
-divergence, ZB/TLT momentum disagreement (futures lead), 10s30s curve behavior
-(bear steepener = worst tape for TLT, bull flattener = best), and the DBA
-commodity tape as an inflation-pressure flag.
+divergence, ZB/TLT momentum disagreement (futures lead), and the DBA commodity
+tape as an inflation-pressure flag.
 
 **Risk**: stop = 15-day swing low − 0.5×ATR; size = (account × risk%) ÷
 (entry − stop); targets = 50-day, then 200-day / +2R.

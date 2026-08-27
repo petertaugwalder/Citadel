@@ -11,8 +11,8 @@ Three-layer model:
                   * TREND-TURN STACK — 8 confirmation conditions across TLT / ZB / ^TYX that
                               light up as a downtrend actually reverses. Tiers: SCOUT >= 3,
                               CONFIRMED >= 5, REGIME FLIP = close over the 200-day.
-  3. CROSS-CHECKS — futures/cash divergence, yield-exhaustion divergence, 10s30s curve
-                behavior, and commodity (DBA) inflation tape as a structural headwind flag.
+  3. CROSS-CHECKS — futures/cash divergence, yield-exhaustion divergence, and the
+                commodity (DBA) inflation tape as a structural headwind flag.
 
 Data: Yahoo Finance daily bars via yfinance (cached locally). This is an end-of-day /
 swing tool, not an intraday one. Nothing here is financial advice.
@@ -45,10 +45,8 @@ TICKERS = {
     "TLT": "TLT",     # trade vehicle: 20+yr Treasury ETF — the only thing traded
     "ZB": "ZB=F",     # 30y T-Bond futures: the leading tape
     "TYX": "^TYX",    # 30y yield index (drives TLT, inverted)
-    "TNX": "^TNX",    # 10y yield — internal input for the 10s30s curve check only
     "DBA": "DBA",     # ag/commodity tape: inflation-pressure flag
 }
-HIDDEN_FROM_TAPE = {"TNX"}  # fetched for cross-checks, never shown as a watchlist row
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
 HISTORY_PERIOD = "2y"
@@ -211,7 +209,6 @@ def demo_frames() -> dict[str, pd.DataFrame]:
         "TLT": (102.0, [(0.55, -0.13), (0.25, -0.05), (0.17, -0.055), (0.03, 0.028)], 0.0055),
         "ZB": (128.0, [(0.55, -0.10), (0.25, -0.04), (0.17, -0.045), (0.03, 0.018)], 0.0045),
         "TYX": (4.10, [(0.55, 0.16), (0.25, 0.05), (0.17, 0.055), (0.03, -0.021)], 0.0065),
-        "TNX": (3.90, [(0.55, 0.13), (0.25, 0.03), (0.17, 0.032), (0.03, -0.017)], 0.0060),
         "DBA": (26.0, [(0.70, 0.02), (0.15, -0.03), (0.15, 0.105)], 0.0060),
     }
     return {k: enrich(_demo_walk(rng, n, s, seg, v)) for k, (s, seg, v) in shapes.items()}
@@ -357,19 +354,7 @@ def divergences(frames: dict) -> list[str]:
 
 def macro_checks(frames: dict) -> list[str]:
     notes = []
-    tyx, tnx, dba = frames.get("TYX"), frames.get("TNX"), frames.get("DBA")
-    if tyx is not None and tnx is not None:
-        spread = (tyx["Close"] - tnx["Close"]).dropna()
-        if len(spread) > 21:
-            d20 = float(spread.iloc[-1] - spread.iloc[-21])
-            yld_up = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-21]) > 0
-            cur = float(spread.iloc[-1])
-            if d20 > 0.03 and yld_up:
-                notes.append(f"Curve: 10s30s widening ({cur:+.2f}, {d20:+.2f}/20d) — bear steepener, the WORST tape for TLT")
-            elif d20 < -0.03 and not yld_up:
-                notes.append(f"Curve: 10s30s narrowing as yields fall ({cur:+.2f}) — bull flattener, the BEST tape for TLT")
-            else:
-                notes.append(f"Curve: 10s30s spread {cur:+.2f} ({d20:+.2f}/20d) — no strong curve signal")
+    dba = frames.get("DBA")
     if dba is not None:
         r = _last(dba, "roc20")
         if not np.isnan(r):
@@ -455,8 +440,6 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0) -
     lit, tier = stack_tier(items, frames.get("TLT"))
     res["stack"] = {"items": items, "lit": lit, "of": len(items), "tier": tier}
     for name, df in frames.items():
-        if name in HIDDEN_FROM_TAPE:
-            continue
         res["tape"][name] = {
             "close": round(_last(df, "Close"), 3),
             "chg1": round(_last(df, "chg1"), 2),
@@ -710,8 +693,6 @@ Layer 3 - CROSS-CHECKS (is the signal honest?)
   * Bullish divergence on TLT lows / RSI - sellers exhausting.
   * Yield exhaustion: ^TYX higher high on weaker RSI - the uptrend in yields
     thinning out. Yield-down is the only durable TLT fuel.
-  * 10s30s curve: long-end-led selloffs (bear steepeners: supply, inflation
-    premium) are the worst environment for TLT and kill bounces early.
   * DBA / commodity tape: food & commodity inflation feeds breakevens ->
     long yields. A hot ag tape (like Aug 2026) argues for renting bounces,
     not marrying them.
