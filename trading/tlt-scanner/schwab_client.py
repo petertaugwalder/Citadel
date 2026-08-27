@@ -18,7 +18,8 @@ The redirect URI must match your app registration EXACTLY (Schwab requires https
 
 Usage:
   python schwab_client.py doctor    # diagnose: creds -> network -> tokens -> data
-  python schwab_client.py login     # one-time browser auth; run again weekly
+  python schwab_client.py login     # one-time browser auth (auto-captures the redirect)
+  python schwab_client.py login --manual   # fallback: paste the redirected URL yourself
   python schwab_client.py status    # token age / expiry
   python schwab_client.py quote SCHD
   python schwab_client.py chain SCHD --min-dte 150 --target-delta 0.70
@@ -34,6 +35,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import shutil
+import ssl
+import subprocess
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 AUTH_URL = "https://api.schwabapi.com/v1/oauth/authorize"
@@ -44,6 +51,8 @@ DEFAULT_REDIRECT = "https://127.0.0.1:8182"
 CONFIG_DIR = Path.home() / ".config" / "tlt-scanner"
 CRED_FILE = CONFIG_DIR / "schwab.json"
 TOKEN_FILE = CONFIG_DIR / "schwab_tokens.json"
+CERT_FILE = CONFIG_DIR / "localhost-cert.pem"
+KEY_FILE = CONFIG_DIR / "localhost-key.pem"
 
 ACCESS_TTL = 30 * 60          # Schwab access tokens last ~30 minutes
 REFRESH_TTL = 7 * 24 * 3600   # refresh tokens last ~7 days, then re-login
@@ -134,8 +143,71 @@ def get_access_token() -> str:
                               "refresh_token": tok["refresh_token"]})["access_token"]
 
 
-def login() -> None:
-    """One-time browser auth. No local HTTPS server: you paste the redirected URL back."""
+def _ensure_cert() -> bool:
+    """Self-signed cert for the loopback callback. Uses the openssl already on macOS."""
+    if CERT_FILE.exists() and KEY_FILE.exists():
+        return True
+    if not shutil.which("openssl"):
+        return False
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+             "-keyout", str(KEY_FILE), "-out", str(CERT_FILE),
+             "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+            check=True, capture_output=True, timeout=60,
+        )
+        KEY_FILE.chmod(0o600)
+        CERT_FILE.chmod(0o600)
+        return True
+    except Exception:
+        return False
+
+
+def _capture_code(redirect_uri: str, timeout: int = 300) -> str | None:
+    """Serve HTTPS on the callback host/port just long enough to catch ?code=."""
+    parsed = urllib.parse.urlparse(redirect_uri)
+    host, port = parsed.hostname or "127.0.0.1", parsed.port or 443
+    box: dict = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            box["code"] = (qs.get("code") or [None])[0]
+            box["error"] = (qs.get("error") or [None])[0]
+            body = (b"<h2>Schwab login captured.</h2><p>You can close this tab and "
+                    b"return to the terminal.</p>" if box.get("code")
+                    else b"<h2>No authorization code in the callback.</h2>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass  # keep the terminal clean
+
+    try:
+        srv = HTTPServer((host, port), Handler)
+    except OSError as e:
+        raise SchwabError(f"cannot listen on {host}:{port} ({e.strerror}) — "
+                          "close whatever is using it, or use --manual") from None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    srv.timeout = timeout
+    t = threading.Thread(target=srv.handle_request, daemon=True)
+    t.start()
+    t.join(timeout)
+    srv.server_close()
+    if box.get("error"):
+        raise SchwabError(f"Schwab returned error={box['error']}")
+    return box.get("code")
+
+
+def login(manual: bool = False) -> None:
+    """Browser auth. Default: a loopback HTTPS listener captures the redirect
+    automatically (no copy-paste, no 30-second race). --manual falls back to pasting."""
     cred = load_credentials()
     params = {"client_id": cred["app_key"], "redirect_uri": cred["redirect_uri"],
               "response_type": "code"}
@@ -150,14 +222,31 @@ def login() -> None:
     print("3. Copy the FULL address-bar URL of that failed page and paste it below.")
     print("   ⚠ THE CODE EXPIRES IN ~30 SECONDS. Have this terminal ready and paste fast;")
     print("     if it fails, just run login again — a stale code is the usual cause.\n")
-    pasted = input("redirected URL (or just the code): ").strip().strip('"\'')
-    if not pasted:
-        raise SchwabError("nothing pasted")
-    if "code=" in pasted:
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
-        code = (qs.get("code") or [None])[0]
-    else:
-        code = pasted  # allow pasting just the code value
+    code = None
+    if not manual and _ensure_cert():
+        print("   Starting a local HTTPS listener to capture the redirect automatically.")
+        print("   Your browser will warn about a self-signed certificate for 127.0.0.1 —")
+        print("   click Advanced → Proceed. That page is served by this script, not the internet.\n")
+        try:
+            webbrowser.open(url)
+            print("   (browser opened; waiting up to 5 minutes for the callback…)\n")
+        except Exception:
+            pass
+        code = _capture_code(cred["redirect_uri"])
+        if not code:
+            print("   no callback captured — falling back to manual paste.\n")
+    elif not manual:
+        print("   openssl not found, so the automatic listener is unavailable.\n")
+
+    if not code:
+        pasted = input("redirected URL (or just the code): ").strip().strip('"\'')
+        if not pasted:
+            raise SchwabError("nothing pasted — run login on its own line, not chained with other commands")
+        if "code=" in pasted:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
+            code = (qs.get("code") or [None])[0]
+        else:
+            code = pasted
     if not code:
         raise SchwabError("no ?code= found — paste the whole address-bar URL, or just the code value")
     try:
@@ -205,13 +294,14 @@ def doctor() -> None:
         print("      (env vars do not survive a new tab — re-export or use the config file)")
         return
 
-    import socket
-    try:
-        socket.create_connection(("api.schwabapi.com", 443), timeout=10).close()
-        print(f"{ok} network: api.schwabapi.com:443 reachable")
+    try:  # a real request: raw sockets can succeed through an intercepting proxy
+        urllib.request.urlopen(AUTH_URL, timeout=15)
+        print(f"{ok} network: api.schwabapi.com responds")
+    except urllib.error.HTTPError:
+        print(f"{ok} network: api.schwabapi.com responds")
     except Exception as e:
-        print(f"{fail} network: cannot reach api.schwabapi.com ({type(e).__name__})")
-        print("      fix: check VPN/firewall — the OAuth and data calls both need this host")
+        print(f"{fail} network: cannot reach api.schwabapi.com — {type(e).__name__}: {str(e)[:80]}")
+        print("      fix: check VPN/proxy/firewall — OAuth and data calls both need this host")
         return
 
     tok = load_tokens()
@@ -369,7 +459,7 @@ def main() -> int:
     cmd = args[0] if args else "status"
     try:
         if cmd == "login":
-            login()
+            login(manual="--manual" in args)
         elif cmd == "status":
             status()
         elif cmd == "doctor":
