@@ -27,6 +27,7 @@ Usage:
   python tlt_scanner.py                 # one-shot scan, live data
   python tlt_scanner.py --demo          # synthetic data (no network) to see the output
   python tlt_scanner.py --history 15    # what the scanner said each of the last 15 sessions
+  python tlt_scanner.py --backtest      # replay the buy/sell rules over the full history
   python tlt_scanner.py --watch 900     # re-scan every 15 min; --notify adds macOS alerts
   python tlt_scanner.py --explain       # print the trading logic
   python tlt_scanner.py --json          # machine-readable output
@@ -55,7 +56,7 @@ TICKERS = {
 }
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
-HISTORY_PERIOD = "2y"
+HISTORY_PERIOD = "3y"  # 200-day warmup still leaves a ~2y tradeable window for --backtest
 
 # ----------------------------------------------------------------------------- indicators
 
@@ -210,7 +211,7 @@ def _demo_walk(rng, n, start, segments, vol):
 def demo_frames() -> dict[str, pd.DataFrame]:
     """Synthetic 2y of data shaped like the Aug-2026 tape: bond bear market + fresh bounce."""
     rng = np.random.default_rng(7)
-    n = 520
+    n = 780
     shapes = {
         "TLT": (102.0, [(0.55, -0.13), (0.25, -0.05), (0.17, -0.055), (0.03, 0.028)], 0.0055),
         "ZB": (128.0, [(0.55, -0.10), (0.25, -0.04), (0.17, -0.045), (0.03, 0.018)], 0.0045),
@@ -536,11 +537,13 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
     return res
 
 
-# ----------------------------------------------------------------------------- history mode
+# ----------------------------------------------------------------------------- daily state (shared by --history and --backtest)
 
 
-def history_frame(frames: dict, n: int) -> pd.DataFrame:
-    """Re-evaluate the signal state for each of the last n sessions (vectorized)."""
+def daily_state(frames: dict) -> pd.DataFrame:
+    """Per-session signal state computed strictly from trailing data — the swing-low
+    pivot only counts after its 4-bar confirmation delay, so a bar-by-bar replay of
+    this frame has no look-ahead."""
     tlt = frames["TLT"]
     idx = tlt.index
 
@@ -548,12 +551,17 @@ def history_frame(frames: dict, n: int) -> pd.DataFrame:
         df = frames.get(key)
         return df[col].reindex(idx).ffill() if df is not None else pd.Series(np.nan, index=idx)
 
+    st = pd.DataFrame(index=idx)
+    for col in ("Open", "High", "Low", "Close", "ema21", "sma50", "sma200", "rsi14", "chg1"):
+        st[col] = tlt[col]
+
     conds = pd.DataFrame(index=idx)
-    conds["tlt_ema"] = tlt["ema9"] > tlt["ema21"]
-    conds["tlt_macd"] = tlt["macd"] > tlt["macd_sig"]
-    conds["tlt_50"] = tlt["Close"] > tlt["sma50"]
-    conds["tlt_50rise"] = tlt["sma50"] > tlt["sma50"].shift(10)
-    lows = pivot_points(tlt["Low"], w=4, kind="low")
+    conds["c1"] = tlt["ema9"] > tlt["ema21"]
+    conds["c2"] = tlt["macd"] > tlt["macd_sig"]
+    conds["c3"] = tlt["Close"] > tlt["sma50"]
+    conds["c4"] = tlt["sma50"] > tlt["sma50"].shift(10)
+    w = 4
+    lows = pivot_points(tlt["Low"], w=w, kind="low")
     hsl = pd.Series(False, index=idx)
     if len(lows) >= 2:
         state, prev, cur = pd.Series(pd.NA, index=idx, dtype="boolean"), None, None
@@ -561,29 +569,233 @@ def history_frame(frames: dict, n: int) -> pd.DataFrame:
             prev, cur = cur, v
             if prev is not None:
                 state.loc[d] = bool(cur > prev)
-        hsl = state.ffill().fillna(False).astype(bool)
-    conds["tlt_hsl"] = hsl
-    conds["zb_mom"] = (aligned("ZB", "ema9") > aligned("ZB", "ema21")) & (aligned("ZB", "macd") > aligned("ZB", "macd_sig"))
-    conds["zb_50"] = aligned("ZB", "Close") > aligned("ZB", "sma50")
-    conds["tyx_50"] = aligned("TYX", "Close") < aligned("TYX", "sma50")
-    stack_n = conds.fillna(False).astype(int).sum(axis=1)
-    bounce = bounce_series(tlt)
+        hsl = state.ffill().shift(w).fillna(False).astype(bool)
+    conds["c5"] = hsl
+    conds["c6"] = (aligned("ZB", "ema9") > aligned("ZB", "ema21")) & (aligned("ZB", "macd") > aligned("ZB", "macd_sig"))
+    conds["c7"] = aligned("ZB", "Close") > aligned("ZB", "sma50")
+    conds["c8"] = aligned("TYX", "Close") < aligned("TYX", "sma50")
+    st["stack"] = conds.fillna(False).astype(int).sum(axis=1)
+    flip = (st["stack"] >= 5) & (tlt["Close"] > tlt["sma200"])
+    st["tier"] = np.select([flip, st["stack"] >= 5, st["stack"] >= 3],
+                           ["FLIP", "CONFIRMED", "SCOUT"], default="NONE")
 
-    prior_low = tlt["Low"].rolling(15).min().shift(1)
-    exit_now = (tlt["Close"] < tlt["ema21"]) | (tlt["Close"] < prior_low)
+    score = pd.Series(0.0, index=idx)
+    for key, invert in (("TLT", False), ("ZB", False), ("TYX", True)):
+        c, s50, s200 = aligned(key, "Close"), aligned(key, "sma50"), aligned(key, "sma200")
+        for cond, wgt in ((c > s200, 2), (c > s50, 1), (s50 > s50.shift(10), 1), (s50 > s200, 1)):
+            bullish = ~cond if invert else cond
+            score = score + np.where(bullish.fillna(False), wgt, -wgt)
+    st["regime"] = score / 15 * 100
+
+    trig = bounce_series(tlt)
+    st["bounce_sig"] = trig
+    st["bounce_fresh"] = trig & ~trig.shift(1, fill_value=False)
+    st["prior_low"] = tlt["Low"].rolling(15).min().shift(1)
+    st["trail"] = np.where(st["tier"].eq("FLIP"), tlt["sma50"], tlt["ema21"])
+    st["exit_trail"] = tlt["Close"] < st["trail"]
+    st["exit_struct"] = tlt["Close"] < st["prior_low"]
+    st["exit_flag"] = st["exit_trail"] | st["exit_struct"]
+    rental = st["tier"].isin(["NONE", "SCOUT"]) & (st["regime"] < -33)
+    tag_reject = rental & (tlt["High"] >= tlt["sma50"]) & (tlt["Close"] <= tlt["sma50"])
+    st["trim_flag"] = tag_reject | (tlt["rsi14"] >= 70)
+    st["ready"] = (tlt["sma200"].notna() & aligned("ZB", "sma200").notna()
+                   & aligned("TYX", "sma200").notna() & st["prior_low"].notna())
+    return st
+
+
+def history_frame(frames: dict, n: int) -> pd.DataFrame:
+    st = daily_state(frames)
     out = pd.DataFrame(
         {
-            "close": tlt["Close"].round(2),
-            "chg%": tlt["chg1"].round(2),
-            "rsi": tlt["rsi14"].round(1),
-            "stack": stack_n.astype(str) + "/8",
-            "bounce": np.where(bounce, "BUY", ""),
-            "tier": np.select([stack_n >= 5, stack_n >= 3], ["CONFIRMED", "SCOUT"], ""),
-            "exit": np.where(exit_now, "EXIT", ""),
+            "close": st["Close"].round(2),
+            "chg%": st["chg1"].round(2),
+            "rsi": st["rsi14"].round(1),
+            "stack": st["stack"].astype(str) + "/8",
+            "bounce": np.where(st["bounce_sig"], "BUY", ""),
+            "tier": st["tier"].replace({"NONE": "", "FLIP": "REGIME FLIP"}),
+            "exit": np.where(st["exit_flag"], "EXIT", ""),
         }
     ).tail(n)
     out.index = [str(d.date()) for d in out.index]
     return out
+
+
+# ----------------------------------------------------------------------------- backtest
+
+TIER_WEIGHT = {"NONE": 0.0, "SCOUT": 1 / 3, "CONFIRMED": 2 / 3, "FLIP": 1.0}
+RENTAL_WEIGHT = 1 / 3
+
+
+def backtest(frames: dict, cost_bps: float = 1.0) -> dict:
+    """Bar-by-bar replay of the scanner's buy/sell rules. Signals form on close T,
+    fills happen at open T+1, costs charged per side on weight changes. Position
+    model: tier entries at 1/3 / 2/3 / 1.0 weight, bounce rentals at 1/3, TRIM
+    halves the position once per new trim signal, EXIT flattens."""
+    st = daily_state(frames)
+    st = st[st["ready"]].copy()
+    if len(st) < 60:
+        return {"error": f"only {len(st)} tradeable sessions after the 200-day warmup"}
+    opens, closes = st["Open"].astype(float), st["Close"].astype(float)
+    n = len(st)
+    rets = np.zeros(n)
+    weights = np.zeros(n)
+    weight = 0.0
+    pending: tuple[float, str] | None = None
+    episodes: list[dict] = []
+    ep: dict | None = None
+
+    for i in range(n):
+        if i > 0:
+            c_prev, c = closes.iloc[i - 1], closes.iloc[i]
+            if pending is not None:
+                new_w, reason = pending
+                o = opens.iloc[i]
+                rets[i] = (weight * (o / c_prev - 1) + new_w * (c / o - 1)
+                           - abs(new_w - weight) * cost_bps / 1e4)
+                if weight == 0 and new_w > 0:
+                    ep = {"entry_date": st.index[i], "entry_px": float(o), "cost_w": new_w * float(o),
+                          "units": new_w, "max_w": new_w, "reasons": [reason],
+                          "stop0": float(st["prior_low"].iloc[i - 1])}
+                elif ep is not None and new_w > weight:
+                    ep["cost_w"] += (new_w - weight) * float(o)
+                    ep["units"] += new_w - weight
+                    ep["max_w"] = max(ep["max_w"], new_w)
+                    if reason not in ep["reasons"]:
+                        ep["reasons"].append(reason)
+                elif ep is not None and new_w == 0:
+                    ep["exit_date"], ep["exit_px"], ep["exit_reason"] = st.index[i], float(o), reason
+                    episodes.append(ep)
+                    ep = None
+                elif ep is not None:  # partial trim
+                    if "TRIM" not in ep["reasons"]:
+                        ep["reasons"].append("TRIM")
+                weight = new_w
+                pending = None
+            else:
+                rets[i] = weight * (c / c_prev - 1)
+        weights[i] = weight
+
+        row = st.iloc[i]
+        tier_w = TIER_WEIGHT[str(row["tier"])]
+        if weight == 0:
+            if tier_w > 0 and not bool(row["exit_flag"]):
+                pending = (tier_w, str(row["tier"]))
+            elif bool(row["bounce_fresh"]) and not bool(row["exit_flag"]):
+                pending = (RENTAL_WEIGHT, "BOUNCE")
+        else:
+            fresh_trim = bool(row["trim_flag"]) and (i == 0 or not bool(st["trim_flag"].iloc[i - 1]))
+            if bool(row["exit_flag"]):
+                pending = (0.0, "STRUCT" if bool(row["exit_struct"]) else "TRAIL")
+            elif fresh_trim:
+                pending = (weight / 2, "TRIM")
+            elif tier_w > weight:
+                pending = (tier_w, str(row["tier"]))
+
+    equity = np.cumprod(1 + rets)
+    for e in episodes + ([ep] if ep is not None else []):
+        i0 = st.index.get_loc(e["entry_date"])
+        i1 = st.index.get_loc(e["exit_date"]) if "exit_date" in e else n - 1
+        e["pnl_pct"] = (equity[i1] / equity[i0 - 1] - 1) * 100 if i0 > 0 else (equity[i1] - 1) * 100
+        e["days"] = i1 - i0 + 1
+        avg_px = e["cost_w"] / e["units"]
+        exit_px = e.get("exit_px", float(closes.iloc[-1]))
+        denom = max(avg_px - e["stop0"], 0.01)
+        e["r_mult"] = (exit_px - avg_px) / denom
+        e["move_pct"] = (exit_px / avg_px - 1) * 100
+    open_ep = ep
+
+    closed = episodes
+    wins = [e for e in closed if e["pnl_pct"] > 0]
+    losses = [e for e in closed if e["pnl_pct"] <= 0]
+    gross_w = sum(e["pnl_pct"] for e in wins)
+    gross_l = abs(sum(e["pnl_pct"] for e in losses))
+    daily = pd.Series(rets)
+    bh = closes / closes.iloc[0]
+    bh_ret = pd.Series(closes).pct_change().fillna(0.0)
+
+    def max_dd(series):
+        s = pd.Series(series)
+        return float(((s / s.cummax()) - 1).min() * 100)
+
+    def sharpe(r):
+        sd = r.std()
+        return float(r.mean() / sd * np.sqrt(252)) if sd > 0 else 0.0
+
+    years = n / 252
+    summary = {
+        "window": f"{st.index[0].date()} → {st.index[-1].date()}",
+        "sessions": n,
+        "cost_bps_per_side": cost_bps,
+        "strategy": {
+            "total_return_pct": round((equity[-1] - 1) * 100, 2),
+            "cagr_pct": round(((equity[-1]) ** (1 / years) - 1) * 100, 2),
+            "max_drawdown_pct": round(max_dd(equity), 2),
+            "sharpe": round(sharpe(daily), 2),
+            "exposure_pct": round(float((weights > 0).mean() * 100), 1),
+            "avg_weight_when_in": round(float(weights[weights > 0].mean()), 2) if (weights > 0).any() else 0.0,
+        },
+        "buy_and_hold_tlt": {
+            "total_return_pct": round(float((bh.iloc[-1] - 1) * 100), 2),
+            "max_drawdown_pct": round(max_dd(bh), 2),
+            "sharpe": round(sharpe(bh_ret), 2),
+        },
+        "trades": {
+            "closed": len(closed),
+            "open_at_end": 1 if open_ep is not None else 0,
+            "win_rate_pct": round(len(wins) / len(closed) * 100, 1) if closed else None,
+            "avg_win_pct": round(gross_w / len(wins), 2) if wins else None,
+            "avg_loss_pct": round(-gross_l / len(losses), 2) if losses else None,
+            "profit_factor": round(gross_w / gross_l, 2) if gross_l > 0 else None,
+            "avg_days_held": round(sum(e["days"] for e in closed) / len(closed), 1) if closed else None,
+        },
+    }
+    trade_rows = closed + ([open_ep] if open_ep is not None else [])
+    caveats = [
+        "IN-SAMPLE: these rules were designed while looking at this same period — results are descriptive, not predictive",
+        "signals form on close T, fills at open T+1; no intraday stops (a gap through the stop fills at the open)",
+        f"costs {cost_bps} bps per side on weight changes; no slippage model beyond that; no taxes",
+        "dividend-adjusted prices: strategy and buy-and-hold both include distributions",
+        "one instrument, one 2-3 year window, mostly one regime — a tiny sample; treat every stat as noisy",
+    ]
+    return {"summary": summary, "episodes": trade_rows, "caveats": caveats}
+
+
+def render_backtest(res: dict) -> None:
+    if "error" in res:
+        print(f"backtest: {res['error']}", file=sys.stderr)
+        return
+    s = res["summary"]
+    strat, bh, tr = s["strategy"], s["buy_and_hold_tlt"], s["trades"]
+    print(f"\n{BOLD}TLT SCANNER BACKTEST{END}  {s['window']}  ({s['sessions']} sessions, "
+          f"{s['cost_bps_per_side']}bps/side)")
+    print("=" * 74)
+    print(f"\n{BOLD}{'':22}{'strategy':>12}{'buy & hold':>14}{END}")
+    print(f"  {'total return':20}{strat['total_return_pct']:>11.2f}%{bh['total_return_pct']:>13.2f}%")
+    print(f"  {'CAGR':20}{strat['cagr_pct']:>11.2f}%{'—':>14}")
+    print(f"  {'max drawdown':20}{strat['max_drawdown_pct']:>11.2f}%{bh['max_drawdown_pct']:>13.2f}%")
+    print(f"  {'sharpe (rf=0)':20}{strat['sharpe']:>12.2f}{bh['sharpe']:>14.2f}")
+    print(f"  {'time in market':20}{strat['exposure_pct']:>11.1f}%{'100.0%':>14}")
+    print(f"  {'avg weight when in':20}{strat['avg_weight_when_in']:>12.2f}{'1.00':>14}")
+    print(f"\n{BOLD}TRADES{END}  {tr['closed']} closed"
+          + (f" + {tr['open_at_end']} open" if tr["open_at_end"] else ""))
+    if tr["closed"]:
+        print(f"  win rate {tr['win_rate_pct']}%   avg win {tr['avg_win_pct']}%   "
+              f"avg loss {tr['avg_loss_pct']}%   profit factor {tr['profit_factor']}   "
+              f"avg hold {tr['avg_days_held']}d")
+    hdr = f"  {'entry':>10} {'px':>7} {'reason':<16} {'exit':>10} {'px':>7} {'why':<7} {'days':>4} {'pnl%':>7} {'R':>6}"
+    print(f"\n{DIM}{hdr}{END}")
+    for e in res["episodes"]:
+        exit_d = str(e["exit_date"].date()) if "exit_date" in e else "OPEN"
+        exit_p = f"{e['exit_px']:.2f}" if "exit_px" in e else "—"
+        why = e.get("exit_reason", "—")
+        col = GREEN if e["pnl_pct"] > 0 else RED
+        print(f"  {str(e['entry_date'].date()):>10} {e['entry_px']:>7.2f} "
+              f"{'+'.join(e['reasons']):<16.16} {exit_d:>10} {exit_p:>7} {why:<7} "
+              f"{e['days']:>4} {col}{e['pnl_pct']:>+7.2f}{END} {e['r_mult']:>+6.2f}")
+    print(f"\n{BOLD}CAVEATS{END}")
+    for c in res["caveats"]:
+        print(f"  ! {c}")
+    print()
 
 
 # ----------------------------------------------------------------------------- rendering
@@ -883,11 +1095,27 @@ def main() -> int:
     ap.add_argument("--account", type=float, help="account size for position sizing")
     ap.add_argument("--risk", type=float, default=1.0, help="risk %% of account per trade (default 1.0)")
     ap.add_argument("--entry", type=float, help="your TLT entry price — adds open P&L and R-multiple to the exit engine")
+    ap.add_argument("--backtest", action="store_true", help="replay the buy/sell rules bar-by-bar over the full history")
+    ap.add_argument("--cost-bps", type=float, default=1.0, help="backtest cost per side in bps (default 1.0)")
     ap.add_argument("--explain", action="store_true", help="print the trading logic and exit")
     args = ap.parse_args()
 
     if args.explain:
         print(LOGIC)
+        return 0
+
+    if args.backtest:
+        frames = demo_frames() if args.demo else load_frames(refresh=args.refresh)
+        if "TLT" not in frames:
+            print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
+            return 1
+        res = backtest(frames, cost_bps=args.cost_bps)
+        if args.json:
+            print(json.dumps(res, indent=2, default=str))
+        else:
+            if args.demo:
+                print(f"\n{YEL}{BOLD}[DEMO DATA — synthetic tape, results validate the pipeline, not the strategy]{END}")
+            render_backtest(res)
         return 0
 
     def one_scan(prev: tuple[str, str] | None = None) -> tuple[dict | None, tuple[str, str] | None]:

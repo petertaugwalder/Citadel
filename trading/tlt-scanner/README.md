@@ -26,6 +26,7 @@ python tlt_scanner.py --explain   # the trading logic, in the terminal
 |---|---|
 | `python tlt_scanner.py` | Full dashboard: tape, regime, triggers, cross-checks, plan |
 | `python tlt_scanner.py --history 15` | What the scanner said each of the last 15 sessions |
+| `python tlt_scanner.py --backtest` | Replay the buy/sell rules bar-by-bar over the full history (`--cost-bps` sets per-side costs, default 1.0) |
 | `python tlt_scanner.py --watch 900 --notify` | Re-scan every 15 min, macOS notification on a new BUY |
 | `python tlt_scanner.py --account 50000 --risk 1.0` | Adds position sizing (risk 1% of $50k per trade) |
 | `python tlt_scanner.py --entry 82.50` | Adds your open P&L and R-multiple to the exit engine |
@@ -102,6 +103,11 @@ EXIT/TRIM verdicts as well as BUYs.
 - **The exit rules are risk-management heuristics, not a validated edge.**
   The 15-day lookback is arbitrary, and RSI ≥ 70 will scratch some squeezes
   that keep running. They bound losses; they do not predict.
+- **The backtest is honest but in-sample.** `--backtest` replays the exact
+  rules with no look-ahead (signals on close T, fills at open T+1, the
+  swing-low pivot gets its 4-bar confirmation delay, costs per side) — but
+  the rules were designed while looking at this same period, and it is one
+  instrument over one short window. Descriptive, not predictive.
 
 ## Files
 
