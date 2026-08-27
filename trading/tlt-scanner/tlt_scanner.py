@@ -188,8 +188,9 @@ def load_frames(refresh: bool = False) -> dict[str, pd.DataFrame]:
             df = fetch_yahoo(symbol)
             if df is not None:
                 df.to_csv(cache)
-            elif cache.exists():  # stale cache beats nothing
-                df = pd.read_csv(cache, index_col=0, parse_dates=True)
+            elif cache.exists():
+                print(f"  ! {name}: stale cache rejected; no analysis generated from fallback data",
+                      file=sys.stderr)
         if df is not None and len(df) >= 60:
             frames[name] = enrich(df)
     # SCHD unadjusted: the price-only series a call buyer actually tracks (no dividends)
@@ -202,7 +203,8 @@ def load_frames(refresh: bool = False) -> dict[str, pd.DataFrame]:
         if px is not None:
             px.to_csv(px_cache)
         elif px_cache.exists():
-            px = pd.read_csv(px_cache, index_col=0, parse_dates=True)
+            print("  ! SCHD_PX: stale cache rejected; no call-path diagnostics generated",
+                  file=sys.stderr)
     if px is not None and len(px) >= 60:
         frames["SCHD_PX"] = enrich(px)
     return frames
