@@ -406,11 +406,11 @@ def divergences(frames: dict) -> list[str]:
 
 
 def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
-    """Derived inputs from the quietly-fetched aux series. Everything here is
-    display / CAUTION material only — no buy/sell booleans, no EXIT rules."""
+    """Derived inputs for the TLT leg only (duration, residual, curve). Display /
+    CAUTION material — no buy/sell booleans, no EXIT rules. SCHD never appears
+    here: the two legs are independent trades and share no state."""
     d_val, d_live = duration
     tlt, tyx, tnx = frames.get("TLT"), frames.get("TYX"), frames.get("TNX")
-    schd = frames.get("SCHD")
     out: dict = {"duration": {"D": round(d_val, 2), "live": bool(d_live)}}
     if tyx is not None and len(tyx) >= 2:
         dy_bp = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-2]) * 100
@@ -432,19 +432,6 @@ def aux_metrics(frames: dict, duration: tuple[float, bool]) -> dict:
             out["curve"] = {"spread_bp": round(bp, 0), "chg5_bp": round(d5, 0), "label": label,
                             "bear_steepener": bool(d5 > 3 and y_up5),
                             "bull_flattener": bool(d5 < -3 and not y_up5)}
-    if schd is not None:
-        c, s50, s200 = _last(schd, "Close"), _last(schd, "sma50"), _last(schd, "sma200")
-        if pd.notna(s50) and pd.notna(s200):
-            stance = ("above both" if c > s50 and c > s200
-                      else "below both" if c < s50 and c < s200 else "mixed")
-        else:
-            stance = "n/a"
-        out["schd"] = {
-            "close": round(c, 2), "stance": stance,
-            "sma50": round(s50, 2) if pd.notna(s50) else None,
-            "sma200": round(s200, 2) if pd.notna(s200) else None,
-            "roc20": round(_last(schd, "roc20"), 1) if not np.isnan(_last(schd, "roc20")) else None,
-        }
     return out
 
 
@@ -501,7 +488,8 @@ def schd_state(frames: dict) -> pd.DataFrame:
 
 def schd_engine(frames: dict, account: float | None = None, risk_pct: float = 1.0,
                 entry: float | None = None) -> dict:
-    """Live SCHD plan: regime, trigger, levels, sizing and exit verdict."""
+    """Live SCHD plan: trend gate, trigger, levels, sizing and exit verdict.
+    Computed only from SCHD's own bars — no TLT/UB/^TYX input, ever."""
     st = schd_state(frames)
     if st.empty or not bool(st["ready"].iloc[-1]):
         return {"error": "no SCHD data"}
