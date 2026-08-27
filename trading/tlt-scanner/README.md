@@ -145,17 +145,37 @@ EXIT/TRIM verdicts as well as BUYs.
 **Risk**: stop = 15-day swing low − 0.5×ATR; size = (account × risk%) ÷
 (entry − stop); targets = 50-day, then 200-day / +2R.
 
-## Backtest verdict (2024-06-12 → 2026-08-26, real data)
+## Backtest verdicts (real data)
 
-On this window the engine **lost to holding TLT**: −12.86% (max DD −18.33%)
-vs buy-and-hold −1.12% (max DD −14.79%), 46% time in market. 29 trades,
-win rate 20.7%, profit factor 0.34; 23 of 29 exits were 21-EMA trail stops.
-The only two real winners (+3.61%, +2.89%) were ~7-week holds that opened
-at SCOUT and ended on STRUCT exits. Costs at 5 bps/side and 0%-cash
-crediting do not flip the vs-B&H verdict. Conclusion: **the dashboard is a
-tape, not an allocator** — use it for regime context, exit discipline, and
-levels; do not auto-trade the BUY tiers, especially flat-state
-CONFIRMED/FLIP opens. No thresholds were changed on this result.
+**TLT, full history 2010-10-25 → 2026-08-27** (3984 sessions, 1bp/side):
+strategy **+8.93%** (max DD −33.13%, Sharpe 0.10) vs buy-and-hold **+28.88%**
+(max DD −48.35%, Sharpe 0.18); 51% time in market, 184 trades, win rate 33.2%,
+profit factor 1.12, average hold 12 days. It still loses to holding, but over
+16 years it is *profitable and roughly halves the drawdown* — a materially
+different picture from the 2-year window below.
+
+**TLT, 2024-06-12 → 2026-08-26** (the window first tested): strategy −12.86%
+(max DD −18.33%) vs buy-and-hold −1.12% (max DD −14.79%); 29 trades, win rate
+20.7%, profit factor 0.34, 23 of 29 exits on the 21-EMA trail. A short, single-
+regime sample — kept here because it is what prompted the "tape, not an
+allocator" conclusion.
+
+**SCHD, 2012-08-06 → 2026-08-27** (3535 sessions, 1bp/side), by exit mode:
+
+| mode | total | CAGR | maxDD | Sharpe | TIM | trades | WR | PF | avg hold |
+|---|---|---|---|---|---|---|---|---|---|
+| `swing` | +43.4% | 2.60% | −26.7% | 0.35 | 53.9% | 83 | 34.1% | 1.48 | 24d |
+| `reduce` | +95.2% | 4.88% | −25.7% | 0.58 | 71.8% | 22 | 28.6% | 2.38 | 113d |
+| **`trend`** | **+126.5%** | 6.00% | −27.1% | 0.63 | 71.8% | 22 | 28.6% | **2.57** | 113d |
+| B&H (TR) | +474.6% | ~13% | −33.4% | 0.88 | 100% | — | — | — | — |
+
+The default `trend` mode triples `swing`'s return with a quarter of the trades
+and 4.7× the average hold — the shape a call buyer needs. All modes still trail
+buy-and-hold, which is expected and **not the objective**: a call holder never
+collects the dividends that dominate that number.
+
+**Read all of the above as descriptive, not predictive** — the rules were
+written after seeing these tapes.
 
 ## The allocator (`--allocate`) — experimental
 

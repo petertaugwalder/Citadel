@@ -1393,7 +1393,8 @@ def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str |
         "signals form on close T, fills at open T+1; no intraday stops (a gap through the stop fills at the open)",
         f"costs {cost_bps} bps per side on weight changes; no slippage model beyond that; no taxes",
         "dividend-adjusted prices: strategy and buy-and-hold both include distributions",
-        "one instrument, one 2-3 year window, mostly one regime — a tiny sample; treat every stat as noisy",
+        f"one instrument over {years:.1f} years and {len(closed)} closed trades — "
+        f"treat every stat as noisy, and note the regime mix in that window",
     ]
     return {"summary": summary, "episodes": trade_rows, "caveats": caveats}
 
