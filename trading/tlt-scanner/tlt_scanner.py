@@ -750,7 +750,9 @@ def main() -> int:
         return 0
 
     def one_scan(prev_action: str | None = None) -> tuple[dict | None, str | None]:
-        frames = demo_frames() if args.demo else load_frames(refresh=args.refresh)
+        # --watch must see fresh bars every cycle; the 4h cache would otherwise serve stale data
+        force = args.refresh or bool(args.watch)
+        frames = demo_frames() if args.demo else load_frames(refresh=force)
         if "TLT" not in frames:
             print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
             return None, None
