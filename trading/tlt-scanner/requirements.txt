@@ -1,4 +1,3 @@
 pandas>=2.2
 numpy>=1.26
-yfinance>=0.2.50
 rich>=13.0

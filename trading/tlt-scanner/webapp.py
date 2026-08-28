@@ -91,12 +91,20 @@ def compute(force: bool = False) -> dict:
         frames = ts.demo_frames() if OPTS.get("demo") else ts.load_frames(refresh=force)
         if "TLT" not in frames:
             raise RuntimeError("no TLT data (network blocked?)")
-        dur = (15.0, False) if OPTS.get("demo") else ts.fetch_duration()
+        dur = ((15.0, False, "synthetic demo assumption") if OPTS.get("demo")
+               else ts.fetch_duration(frames))
         res = ts.analyze(frames, account=OPTS.get("account"), risk_pct=OPTS.get("risk", 1.0),
                          entry=OPTS.get("entry"), duration=dur,
                          schd_entry=OPTS.get("schd_entry"), schd_exit=OPTS.get("schd_exit", "trend"))
         if OPTS.get("options") and "error" not in res["schd"]:
-            res["options"] = ts.schd_options(res["schd"]["close"], source=OPTS.get("options_source", "auto"))
+            sc = res["schd"]
+            res["option_books"] = ts.ranked_option_books(
+                float(frames["TLT"]["Close"].iloc[-1]), sc["close"])
+            res["options"] = ts.schd_options(
+                sc["close"], entry_signal_confirmed=sc.get("entry_signal_confirmed", False),
+                entry_signal_rule=sc.get("entry_signal_rule"),
+                source=OPTS.get("options_source", "schwab"),
+                selection=res["option_books"]["SCHD"]["call"])
         res["_spark"] = {k: [round(float(v), 4) for v in frames[k]["Close"].tail(60)]
                          for k in ("TLT", "SCHD") if k in frames}
         with LOCK:
@@ -187,6 +195,13 @@ def render(res: dict) -> str:
         body = ("".join(f'<div class="lv"><span>{esc(l)}</span></div>'
                         for l in ts.options_lines(o)))
         opt_html = f'<section class="card"><h2>SCHD calls</h2>{body}</section>'
+    books = res.get("option_books") or {}
+    if books:
+        book_body = "".join(
+            f'<div class="lv"><span>{esc(ts.ranked_contract_line(ticker, side, books[ticker][side]))}</span></div>'
+            for ticker in ("TLT", "SCHD") for side in ("call", "put"))
+        opt_html += (f'<section class="card wide"><h2>Top-ranked calls and puts</h2>{book_body}'
+                     '<p class="note">Preferences affect score only; data-integrity exclusions still apply.</p></section>')
 
     src = " · DEMO DATA" if OPTS.get("demo") else ""
     age = int((time.time() - STATE["at"]) / 60)
@@ -283,7 +298,7 @@ def main() -> int:
     ap.add_argument("--schd-entry", type=float)
     ap.add_argument("--schd-exit", choices=("swing", "reduce", "trend"), default="trend")
     ap.add_argument("--options", action="store_true")
-    ap.add_argument("--options-source", choices=("auto", "schwab", "yfinance"), default="auto")
+    ap.add_argument("--options-source", choices=("schwab",), default="schwab")
     a = ap.parse_args()
     OPTS.update(vars(a))
 

@@ -5,3 +5,5 @@ schwab.json
 schwab_tokens.json
 *.token
 .env
+data/schwab/*/
+data/schwab/latest.json

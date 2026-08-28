@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-schwab_client.py — Schwab Trader API client for the SCHD call panel.
+schwab_client.py — Schwab Trader API client for scanner histories and SCHD calls.
 
-Why: Schwab returns REAL option greeks and two-sided quotes for SCHD, replacing the
-Black-Scholes approximation in tlt_scanner.py. Stdlib only — no new dependencies.
+Schwab supplies every live market-data input: TLT, SCHD, /UB, $TYX, $TNX,
+plus real SCHD option greeks and two-sided quotes. Stdlib only.
 
 What this does NOT give you: historical option marks. Schwab serves the CURRENT
 chain only, so the SCHD backtest stays ETF-path timing. Nothing here measures
@@ -23,7 +23,7 @@ Usage:
   python schwab_client.py login --code '<redirected URL or bare code>'   # non-interactive
   python schwab_client.py status    # token age / expiry
   python schwab_client.py quote SCHD
-  python schwab_client.py chain SCHD --min-dte 150 --target-delta 0.70
+  python schwab_client.py chain SCHD --side BOTH
   python schwab_client.py logout    # delete stored tokens
 """
 from __future__ import annotations
@@ -41,8 +41,10 @@ import ssl
 import subprocess
 import threading
 import webbrowser
+from datetime import datetime, time as clock_time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 AUTH_URL = "https://api.schwabapi.com/v1/oauth/authorize"
 TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
@@ -55,8 +57,32 @@ TOKEN_FILE = CONFIG_DIR / "schwab_tokens.json"
 CERT_FILE = CONFIG_DIR / "localhost-cert.pem"
 KEY_FILE = CONFIG_DIR / "localhost-key.pem"
 
+# Reuse the already-authorized Energy Desk Schwab app when the scanner has no
+# private config of its own.  Both clients then share one rotating token file;
+# secrets are read locally and are never copied into this repository.
+SHARED_ENV_FILE = Path(os.environ.get(
+    "TLT_SCANNER_SCHWAB_ENV",
+    "/Users/maciejsmoczynski/bbbot-rotation/sector_rotation.env",
+))
+SHARED_TOKEN_FILE = Path(os.environ.get(
+    "TLT_SCANNER_SCHWAB_TOKEN",
+    "/Users/maciejsmoczynski/bbbot-rotation/sector_rotation_data/schwab_token.json",
+))
+
 ACCESS_TTL = 30 * 60          # Schwab access tokens last ~30 minutes
 REFRESH_TTL = 7 * 24 * 3600   # refresh tokens last ~7 days, then re-login
+
+CALL_MIN_DTE = 50
+CALL_MAX_DTE = 75
+CALL_MIN_DELTA = 0.65
+CALL_MAX_DELTA = 0.80
+CALL_TARGET_DTE = 63
+CALL_TARGET_DELTA = 0.70
+CALL_MAX_SPREAD_PCT = 10.0
+CALL_MIN_OPEN_INTEREST = 100
+CALL_MIN_VOLUME = 5
+CALL_MAX_BREAKEVEN_MOVE_PCT = 8.0
+CALL_MAX_LIVE_QUOTE_AGE_SEC = 20 * 60
 
 
 class SchwabError(RuntimeError):
@@ -82,6 +108,20 @@ def load_credentials() -> dict:
         if c.get("app_key") and c.get("app_secret"):
             c.setdefault("redirect_uri", DEFAULT_REDIRECT)
             return c
+    if SHARED_ENV_FILE.exists():
+        env = {}
+        for line in SHARED_ENV_FILE.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip().strip("\"'")
+        if env.get("SCHWAB_APP_KEY") and env.get("SCHWAB_APP_SECRET"):
+            return {
+                "app_key": env["SCHWAB_APP_KEY"],
+                "app_secret": env["SCHWAB_APP_SECRET"],
+                "redirect_uri": env.get("SCHWAB_CALLBACK_URL", DEFAULT_REDIRECT),
+                "_source": str(SHARED_ENV_FILE),
+            }
     raise SchwabError(
         "no Schwab credentials found — set SCHWAB_APP_KEY and SCHWAB_APP_SECRET, "
         f"or create {CRED_FILE} with app_key/app_secret/redirect_uri (chmod 600)"
@@ -89,12 +129,48 @@ def load_credentials() -> dict:
 
 
 def load_tokens() -> dict | None:
-    if not TOKEN_FILE.exists():
-        return None
-    try:
-        return json.loads(TOKEN_FILE.read_text())
-    except Exception:
-        return None
+    if TOKEN_FILE.exists():
+        try:
+            tok = json.loads(TOKEN_FILE.read_text())
+            tok["_storage"] = "scanner"
+            tok["_token_file"] = str(TOKEN_FILE)
+            return tok
+        except Exception:
+            return None
+    if SHARED_TOKEN_FILE.exists():
+        try:
+            payload = json.loads(SHARED_TOKEN_FILE.read_text())
+            raw = dict(payload["token"])
+            created = float(payload["creation_timestamp"])
+            expires = float(raw.get("expires_at") or 0)
+            raw["obtained_at"] = expires - float(raw.get("expires_in") or ACCESS_TTL)
+            raw["access_expires_at"] = expires
+            raw["refresh_expires_at"] = created + REFRESH_TTL
+            raw["_storage"] = "schwab-py"
+            raw["_token_file"] = str(SHARED_TOKEN_FILE)
+            raw["_creation_timestamp"] = created
+            raw["_raw_token"] = dict(payload["token"])
+            return raw
+        except Exception:
+            return None
+    return None
+
+
+def _store_refreshed_token(tok: dict, previous: dict) -> None:
+    if previous.get("_storage") == "schwab-py":
+        raw = dict(previous.get("_raw_token") or {})
+        raw.update({k: v for k, v in tok.items() if not k.startswith("_")
+                    and k not in ("obtained_at", "access_expires_at", "refresh_expires_at")})
+        raw["expires_at"] = tok["access_expires_at"]
+        payload = {"creation_timestamp": previous["_creation_timestamp"], "token": raw}
+        path = Path(previous["_token_file"])
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.chmod(0o600)
+        tmp.replace(path)
+    else:
+        clean = {k: v for k, v in tok.items() if not k.startswith("_")}
+        _write_private(TOKEN_FILE, clean)
 
 
 def _post_token(cred: dict, form: dict) -> dict:
@@ -124,7 +200,7 @@ def _post_token(cred: dict, form: dict) -> dict:
     tok["refresh_expires_at"] = (prev.get("refresh_expires_at")
                                  if form.get("grant_type") == "refresh_token" and prev.get("refresh_expires_at")
                                  else now + REFRESH_TTL)
-    _write_private(TOKEN_FILE, tok)
+    _store_refreshed_token(tok, prev)
     return tok
 
 
@@ -413,14 +489,29 @@ def quote(symbol: str) -> dict:
     return api_get("/marketdata/v1/quotes", {"symbols": symbol})
 
 
+def price_history(symbol: str, start_ms: int, end_ms: int) -> dict:
+    """Schwab daily OHLCV only; callers must validate and scale instrument units."""
+    return api_get("/marketdata/v1/pricehistory", {
+        "symbol": symbol,
+        "periodType": "year",
+        "startDate": int(start_ms),
+        "endDate": int(end_ms),
+        "frequencyType": "daily",
+        "frequency": 1,
+        "needExtendedHoursData": "false",
+        "needPreviousClose": "false",
+    })
+
+
 def option_chain(symbol: str, contract_type: str = "CALL", strike_count: int = 40) -> dict:
     return api_get("/marketdata/v1/chains", {"symbol": symbol, "contractType": contract_type,
                                              "strikeCount": strike_count, "includeUnderlyingQuote": "true"})
 
 
-def _iter_contracts(chain: dict):
-    """Flatten Schwab's callExpDateMap -> {expiry: {strike: [contract, ...]}}."""
-    for exp_key, strikes in (chain.get("callExpDateMap") or {}).items():
+def _iter_contracts(chain: dict, side: str = "CALL"):
+    """Flatten one side of Schwab's expiry/strike contract map."""
+    key = "callExpDateMap" if side.upper() == "CALL" else "putExpDateMap"
+    for exp_key, strikes in (chain.get(key) or {}).items():
         # keys look like "2027-01-15:141" (expiry:daysToExpiration)
         exp_date = exp_key.split(":")[0]
         for _, contracts in (strikes or {}).items():
@@ -428,54 +519,219 @@ def _iter_contracts(chain: dict):
                 yield exp_date, c
 
 
-def pick_call(symbol: str = "SCHD", spot: float | None = None,
-              min_dte: int = 150, target_delta: float = 0.70) -> dict:
-    """Choose an expiry past min_dte and the strike closest to target_delta, using
-    Schwab's own greeks and quotes. Same dict shape the scanner's panel expects."""
-    chain = option_chain(symbol)
-    if spot is None:
-        u = chain.get("underlying") or {}
-        spot = float(u.get("last") or u.get("mark") or 0) or None
-    rows = []
-    for exp_date, c in _iter_contracts(chain):
-        dte = int(c.get("daysToExpiration") or 0)
-        bid, ask = float(c.get("bid") or 0), float(c.get("ask") or 0)
-        mid = float(c.get("mark") or 0) or (bid + ask) / 2
-        delta = c.get("delta")
-        if dte < min_dte or mid <= 0 or delta in (None, "NaN"):
-            continue
-        try:
-            delta = float(delta)
-        except (TypeError, ValueError):
-            continue
-        rows.append({"expiry": exp_date, "dte": dte, "strike": float(c.get("strikePrice") or 0),
-                     "bid": bid, "ask": ask, "mid": mid, "delta": delta,
-                     "theta_day": float(c.get("theta") or 0),
-                     "iv": float(c.get("volatility") or 0) / 100.0,
-                     "oi": int(c.get("openInterest") or 0),
-                     "volume": int(c.get("totalVolume") or 0)})
-    if not rows:
-        raise SchwabError(f"no {symbol} calls with quotes and greeks at >= {min_dte} DTE")
-    nearest_dte = min(r["dte"] for r in rows)
-    same_exp = [r for r in rows if r["dte"] == nearest_dte]
-    pick = min(same_exp, key=lambda r: abs(r["delta"] - target_delta))
-    atm = min(same_exp, key=lambda r: abs(r["strike"] - (spot or r["strike"])))
-    spread_pct = (pick["ask"] - pick["bid"]) / pick["mid"] * 100 if pick["mid"] else None
-    return {
-        "source": "schwab",
-        "expiry": pick["expiry"], "dte": pick["dte"], "spot": round(spot, 2) if spot else None,
-        "atm_iv_pct": round(atm["iv"] * 100, 1),
-        "strike": pick["strike"], "mid": round(pick["mid"], 2),
-        "bid": round(pick["bid"], 2), "ask": round(pick["ask"], 2),
-        "spread_pct": round(spread_pct, 1) if spread_pct is not None else None,
-        "delta": round(pick["delta"], 2),
-        "theta_day": round(pick["theta_day"], 4),
-        "theta_pct_of_premium_per_day": round(abs(pick["theta_day"]) / pick["mid"] * 100, 2) if pick["mid"] else None,
-        "open_interest": pick["oi"], "volume": pick["volume"],
-        "breakeven": round(pick["strike"] + pick["mid"], 2),
-        "breakeven_move_pct": round((pick["strike"] + pick["mid"] - spot) / spot * 100, 2) if spot else None,
-        "premium_pct_of_notional": round(pick["mid"] / spot * 100, 1) if spot else None,
+def _expected_quote_session(now: datetime) -> tuple[datetime.date, bool]:
+    """Expected latest US session date and whether that session is currently open."""
+    et = now.astimezone(ZoneInfo("America/New_York"))
+    live = et.weekday() < 5 and clock_time(9, 30) <= et.time() <= clock_time(16, 15)
+    if et.weekday() < 5 and et.time() >= clock_time(9, 30):
+        session = et.date()
+    else:
+        session = et.date() - timedelta(days=1)
+        while session.weekday() >= 5:
+            session -= timedelta(days=1)
+    return session, live
+
+
+def _quote_fresh(quote_ms: int | float | None, now: datetime) -> tuple[bool, float | None]:
+    try:
+        q = datetime.fromtimestamp(float(quote_ms) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return False, None
+    expected, live = _expected_quote_session(now)
+    age = max(0.0, (now.astimezone(timezone.utc) - q).total_seconds())
+    same_session = q.astimezone(ZoneInfo("America/New_York")).date() == expected
+    return bool(same_session and (not live or age <= CALL_MAX_LIVE_QUOTE_AGE_SEC)), age
+
+
+def _chain_health(chain: dict, side: str = "CALL") -> dict:
+    side = side.upper()
+    checks = {
+        "status_success": str(chain.get("status") or "").upper() == "SUCCESS",
+        "not_delayed": chain.get("isDelayed") is False,
+        "not_truncated": chain.get("isChainTruncated") is False,
+        "has_requested_side": bool(chain.get("callExpDateMap" if side == "CALL" else "putExpDateMap")),
+        "underlying_positive": float(chain.get("underlyingPrice") or 0) > 0,
     }
+    return {"ok": all(checks.values()), "checks": checks}
+
+
+def _rank_score(row: dict, target_dte: int, target_delta: float,
+                max_spread_pct: float, min_oi: int, min_volume: int,
+                max_breakeven_move_pct: float,
+                dte_score_span: float = 13.0) -> tuple[float, dict]:
+    """Transparent 100-point execution-quality score; higher is better."""
+    components = {
+        "spread": 30 * max(0.0, 1 - row["spread_pct"] / max_spread_pct),
+        "liquidity": (15 * min(1.0, row["oi"] / max(min_oi * 10, 1))
+                      + 10 * min(1.0, row["volume"] / max(min_volume * 10, 1))),
+        "theta": 15 * max(0.0, 1 - row["theta_pct_day"] / 0.20),
+        "delta_fit": 15 * max(0.0, 1 - abs(row["delta"] - target_delta) / 0.15),
+        "dte_fit": 10 * max(0.0, 1 - abs(row["dte"] - target_dte)
+                            / max(float(dte_score_span), 1.0)),
+        "breakeven": 5 * min(1.0, max(0.0, 1 - row["breakeven_move_pct"] / max_breakeven_move_pct)),
+    }
+    return sum(components.values()), {k: round(v, 2) for k, v in components.items()}
+
+
+def pick_option(symbol: str, side: str, spot: float | None = None,
+                min_dte: int = CALL_MIN_DTE, max_dte: int = CALL_MAX_DTE,
+                target_dte: int = CALL_TARGET_DTE,
+                min_delta: float = CALL_MIN_DELTA, max_delta: float = CALL_MAX_DELTA,
+                target_delta: float = CALL_TARGET_DELTA,
+                max_spread_pct: float = CALL_MAX_SPREAD_PCT,
+                min_open_interest: int = CALL_MIN_OPEN_INTEREST,
+                min_volume: int = CALL_MIN_VOLUME,
+                max_breakeven_move_pct: float = CALL_MAX_BREAKEVEN_MOVE_PCT,
+                now: datetime | None = None, chain_data: dict | None = None) -> dict:
+    """Always rank the best executable contract; preferences never exclude it.
+
+    Only corrupted/untradeable inputs are excluded: unhealthy chains, stale
+    quotes, invalid two-sided markets, bad strikes/expiries, and non-standard
+    deliverables.  DTE, delta, spread, liquidity and breakeven are ranking
+    preferences and warnings, not eligibility gates.
+    """
+    side = side.upper()
+    if side not in ("CALL", "PUT"):
+        raise ValueError("side must be CALL or PUT")
+    chain = chain_data if chain_data is not None else option_chain(symbol, contract_type=side, strike_count=80)
+    now = now or datetime.now(timezone.utc)
+    health = _chain_health(chain, side)
+    if spot is None:
+        spot = float(chain.get("underlyingPrice") or 0) or None
+    preferences = {
+        "days_to_expiry": [min_dte, max_dte], "delta_abs": [min_delta, max_delta],
+        "target_days": target_dte, "target_delta_abs": target_delta,
+        "preferred_max_spread_pct": max_spread_pct,
+        "preferred_min_open_interest": min_open_interest,
+        "preferred_min_volume": min_volume,
+        "preferred_max_breakeven_move_pct": max_breakeven_move_pct,
+    }
+    base = {"source": "schwab", "symbol": symbol, "side": side,
+            "ranking_policy": "preferences_not_gates", "preferences": preferences,
+            "thresholds": preferences, "chain_health": health}
+    if not health["ok"] or not spot or spot <= 0:
+        return {**base, "contract_selected": False, "contract_qualified": False,
+                "status": "CHAIN_REJECTED", "candidates_scanned": 0,
+                "ranked_candidates": 0, "rejection_counts": {"chain_health": 1}}
+
+    rows, rejection_counts = [], {}
+    scanned = 0
+
+    def reject(reason: str) -> None:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    for exp_date, c in _iter_contracts(chain, side):
+        scanned += 1
+        try:
+            dte = int(c.get("daysToExpiration") or 0)
+            strike = float(c.get("strikePrice") or 0)
+            bid, ask = float(c.get("bid") or 0), float(c.get("ask") or 0)
+            oi, volume = int(c.get("openInterest") or 0), int(c.get("totalVolume") or 0)
+        except (TypeError, ValueError, OverflowError):
+            reject("malformed_contract")
+            continue
+        fresh, age = _quote_fresh(c.get("quoteTimeInLong"), now)
+        if dte <= 0 or strike <= 0:
+            reject("invalid_strike_or_expiry")
+            continue
+        if bid <= 0 or ask < bid:
+            reject("invalid_bid_ask")
+            continue
+        if not fresh:
+            reject("stale_quote")
+            continue
+        if bool(c.get("nonStandard")) or bool(c.get("mini")):
+            reject("nonstandard_contract")
+            continue
+        raw_delta = c.get("delta")
+        try:
+            signed_delta = float(raw_delta)
+            delta_abs = abs(signed_delta)
+        except (TypeError, ValueError, OverflowError):
+            signed_delta, delta_abs = None, -1.0
+        try:
+            theta = float(c.get("theta") or 0)
+        except (TypeError, ValueError, OverflowError):
+            theta = 0.0
+        try:
+            iv = float(c.get("volatility") or 0) / 100.0
+        except (TypeError, ValueError, OverflowError):
+            iv = 0.0
+        mid = (bid + ask) / 2
+        spread_pct = (ask - bid) / mid * 100
+        breakeven = strike + ask if side == "CALL" else strike - ask
+        be_move = ((breakeven - spot) / spot * 100 if side == "CALL"
+                   else (spot - breakeven) / spot * 100)
+        warnings_ = []
+        if not min_dte <= dte <= max_dte: warnings_.append("outside_preferred_days")
+        if delta_abs < 0 or not min_delta <= delta_abs <= max_delta: warnings_.append("outside_preferred_delta")
+        if spread_pct > max_spread_pct: warnings_.append("wide_spread")
+        if oi < min_open_interest: warnings_.append("low_open_interest")
+        if volume < min_volume: warnings_.append("low_volume")
+        if be_move > max_breakeven_move_pct: warnings_.append("large_breakeven_move")
+        row = {"contract_symbol": "".join(str(c.get("symbol") or "").split()),
+               "expiry": exp_date, "dte": dte, "strike": strike,
+               "bid": bid, "ask": ask, "mid": mid, "delta": delta_abs,
+               "signed_delta": signed_delta, "theta_day": theta,
+               "theta_pct_day": abs(theta) / ask * 100, "iv": iv,
+               "oi": oi, "volume": volume, "spread_pct": spread_pct,
+               "breakeven": breakeven, "breakeven_move_pct": be_move,
+               "quote_age_seconds": age, "warnings": warnings_}
+        dte_score_span = max(target_dte - min_dte, max_dte - target_dte, 1)
+        score, components = _rank_score(row, target_dte, target_delta, max_spread_pct,
+                                        min_open_interest, min_volume, max_breakeven_move_pct,
+                                        dte_score_span=dte_score_span)
+        row["rank_score"], row["score_components"] = score, components
+        rows.append(row)
+
+    base.update({"candidates_scanned": scanned, "ranked_candidates": len(rows),
+                 "qualified_candidates": len(rows), "rejection_counts": rejection_counts})
+    if not rows:
+        return {**base, "contract_selected": False, "contract_qualified": False,
+                "status": "NO_EXECUTABLE_CONTRACT"}
+
+    pick = max(rows, key=lambda r: (r["rank_score"], r["oi"], r["volume"], -r["spread_pct"]))
+    same_exp = [r for r in rows if r["expiry"] == pick["expiry"]]
+    atm = min(same_exp, key=lambda r: abs(r["strike"] - spot))
+    return {
+        **base, "contract_selected": True, "contract_qualified": True,
+        "status": "TOP_RANKED_CONTRACT", "contract_symbol": pick["contract_symbol"],
+        "expiry": pick["expiry"], "dte": pick["dte"], "spot": round(spot, 2),
+        "atm_iv_pct": round(atm["iv"] * 100, 1), "strike": pick["strike"],
+        "mid": round(pick["mid"], 2), "bid": round(pick["bid"], 2),
+        "ask": round(pick["ask"], 2), "spread_pct": round(pick["spread_pct"], 2),
+        "delta": round(pick["signed_delta"], 3) if pick["signed_delta"] is not None else None,
+        "delta_abs": round(pick["delta"], 3) if pick["delta"] >= 0 else None,
+        "theta_day": round(pick["theta_day"], 4),
+        "theta_pct_of_premium_per_day": round(pick["theta_pct_day"], 3),
+        "open_interest": pick["oi"], "volume": pick["volume"],
+        "breakeven": round(pick["breakeven"], 2), "breakeven_basis": "ask",
+        "breakeven_move_pct": round(pick["breakeven_move_pct"], 2),
+        "premium_pct_of_notional": round(pick["ask"] / spot * 100, 1),
+        "quote_age_seconds": round(pick["quote_age_seconds"], 0),
+        "rank_score": round(pick["rank_score"], 2),
+        "score_components": pick["score_components"], "warnings": pick["warnings"],
+    }
+
+
+def pick_call(symbol: str = "SCHD", **kwargs) -> dict:
+    return pick_option(symbol, "CALL", **kwargs)
+
+
+def pick_put(symbol: str = "TLT", **kwargs) -> dict:
+    return pick_option(symbol, "PUT", **kwargs)
+
+
+def best_options(symbol: str, spot: float | None = None,
+                 now: datetime | None = None, chain_data: dict | None = None,
+                 **preferences) -> dict:
+    """Return both top-ranked sides from one consistent Schwab chain snapshot."""
+    chain = chain_data if chain_data is not None else option_chain(symbol, contract_type="ALL", strike_count=80)
+    if spot is None:
+        spot = float(chain.get("underlyingPrice") or 0) or None
+    return {"source": "schwab", "symbol": symbol,
+            "call": pick_option(symbol, "CALL", spot=spot, now=now, chain_data=chain, **preferences),
+            "put": pick_option(symbol, "PUT", spot=spot, now=now, chain_data=chain, **preferences)}
 
 
 # ----------------------------------------------------------------- CLI
@@ -498,9 +754,16 @@ def main() -> int:
             print(json.dumps(quote(args[1] if len(args) > 1 else "SCHD"), indent=2))
         elif cmd == "chain":
             sym = args[1] if len(args) > 1 and not args[1].startswith("-") else "SCHD"
-            dte = int(args[args.index("--min-dte") + 1]) if "--min-dte" in args else 150
+            min_dte = int(args[args.index("--min-dte") + 1]) if "--min-dte" in args else CALL_MIN_DTE
+            max_dte = int(args[args.index("--max-dte") + 1]) if "--max-dte" in args else CALL_MAX_DTE
+            target_dte = int(args[args.index("--target-dte") + 1]) if "--target-dte" in args else CALL_TARGET_DTE
             dl = float(args[args.index("--target-delta") + 1]) if "--target-delta" in args else 0.70
-            print(json.dumps(pick_call(sym, min_dte=dte, target_delta=dl), indent=2))
+            side = args[args.index("--side") + 1].upper() if "--side" in args else "BOTH"
+            prefs = {"min_dte": min_dte, "max_dte": max_dte,
+                     "target_dte": target_dte, "target_delta": dl}
+            result = (best_options(sym, **prefs) if side == "BOTH"
+                      else pick_option(sym, side, **prefs))
+            print(json.dumps(result, indent=2))
         else:
             print(__doc__)
             return 1
