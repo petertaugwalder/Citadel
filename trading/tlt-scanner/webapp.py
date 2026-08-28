@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-webapp.py — local web dashboard for the TLT / SCHD scanner.
+webapp.py — local web dashboard for the TLT scanner.
 
 Same engines as tlt_scanner.py, rendered as a page instead of a terminal panel.
 Stdlib only (no Flask): http.server + the scanner's own analyze().
@@ -8,7 +8,7 @@ Stdlib only (no Flask): http.server + the scanner's own analyze().
   python webapp.py                 # http://127.0.0.1:8787
   python webapp.py --lan           # also reachable from your phone on the LAN
   python webapp.py --port 9000 --refresh-min 10
-  python webapp.py --entry 83.10 --schd-entry 34.20 --options
+  python webapp.py --entry 83.10 --account 50000
 
 Endpoints:  /  dashboard   |   /api  JSON   |   /health
 
@@ -94,19 +94,9 @@ def compute(force: bool = False) -> dict:
         dur = ((15.0, False, "synthetic demo assumption") if OPTS.get("demo")
                else ts.fetch_duration(frames))
         res = ts.analyze(frames, account=OPTS.get("account"), risk_pct=OPTS.get("risk", 1.0),
-                         entry=OPTS.get("entry"), duration=dur,
-                         schd_entry=OPTS.get("schd_entry"), schd_exit=OPTS.get("schd_exit", "trend"))
-        if OPTS.get("options") and "error" not in res["schd"]:
-            sc = res["schd"]
-            res["option_books"] = ts.ranked_option_books(
-                float(frames["TLT"]["Close"].iloc[-1]), sc["close"])
-            res["options"] = ts.schd_options(
-                sc["close"], entry_signal_confirmed=sc.get("entry_signal_confirmed", False),
-                entry_signal_rule=sc.get("entry_signal_rule"),
-                source=OPTS.get("options_source", "schwab"),
-                selection=res["option_books"]["SCHD"]["call"])
+                         entry=OPTS.get("entry"), duration=dur)
         res["_spark"] = {k: [round(float(v), 4) for v in frames[k]["Close"].tail(60)]
-                         for k in ("TLT", "SCHD") if k in frames}
+                         for k in ("TLT",) if k in frames}
         with LOCK:
             STATE.update(res=res, at=time.time(), err=None)
         return res
@@ -141,7 +131,7 @@ def checks(items, key="on", label="name") -> str:
 
 
 def render(res: dict) -> str:
-    reg, st, ex, plan, sc = res["regime"], res["stack"], res["exit"], res["plan"], res["schd"]
+    reg, st, ex, plan = res["regime"], res["stack"], res["exit"], res["plan"]
     reg_cls = {"BULLISH": "on", "BEARISH": "hot"}.get(reg["label"], "wa")
     ex_cls = ("hot" if ex["verdict"].startswith("EXIT") else
               "wa" if ex["verdict"].startswith(("TRIM", "CAUTION")) else "on")
@@ -167,49 +157,13 @@ def render(res: dict) -> str:
         ] + ([("size", f'{lv["shares_for_risk"]} sh @ ${lv["risk_amount"]:.0f} risk')]
              if "shares_for_risk" in lv else []))
 
-    schd_html = '<p class="muted">no SCHD data</p>'
-    if "error" not in sc:
-        sl = sc["levels"]
-        h = sc.get("hold_window")
-        hold = (f'{h["p25"]}–{h["p75"]} sessions (median {h["median"]})'
-                + (" · thin sample" if h["n"] < 5 else "")) if h else "—"
-        sc_cls = ("on" if sc["action"].startswith(("BUY", "HOLD")) else
-                  "hot" if sc["action"].startswith("EXIT") else "wa")
-        schd_html = (
-            f'<div class="hero {sc_cls}">{esc(sc["action"].split(" — ")[0])}</div>'
-            f'<div class="sub">{esc(sc["why"])}</div>'
-            + spark(res.get("_spark", {}).get("SCHD", []), "var(--accent)")
-            + checks(sc["gate"])
-            + f'<div class="lv"><span>hold window</span><b>{esc(hold)}</b></div>'
-              f'<div class="lv"><span>20-EMA / 50-day / 200-day</span>'
-              f'<b>{sl["ema20"]:.2f} · {sl["sma50"]:.2f} · {sl["sma200"]:.2f}</b></div>'
-              f'<div class="lv"><span>invalidation</span><b>{sl["invalidation"]:.2f}</b></div>'
-            + (f'<div class="lv"><span>ETF ref fill</span><b>{sc["position"]["entry"]:.2f} → '
-               f'{sc["position"]["pnl_pct"]:+.2f}%</b></div>' if sc.get("position") else "")
-            + f'<p class="note">Calls only — no share size. Exit mode <b>{esc(sc["exit_mode"])}</b>. '
-              f'ETF reference only, not call P&amp;L.</p>')
-
-    opt_html = ""
-    if res.get("options"):
-        o = res["options"]
-        body = ("".join(f'<div class="lv"><span>{esc(l)}</span></div>'
-                        for l in ts.options_lines(o)))
-        opt_html = f'<section class="card"><h2>SCHD calls</h2>{body}</section>'
-    books = res.get("option_books") or {}
-    if books:
-        book_body = "".join(
-            f'<div class="lv"><span>{esc(ts.ranked_contract_line(ticker, side, books[ticker][side]))}</span></div>'
-            for ticker in ("TLT", "SCHD") for side in ("call", "put"))
-        opt_html += (f'<section class="card wide"><h2>Top-ranked calls and puts</h2>{book_body}'
-                     '<p class="note">Preferences affect score only; data-integrity exclusions still apply.</p></section>')
-
     src = " · DEMO DATA" if OPTS.get("demo") else ""
     age = int((time.time() - STATE["at"]) / 60)
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="{OPTS.get('refresh_min', 15) * 60}">
-<title>TLT / SCHD scanner</title><style>{CSS}</style></head><body>
-<div class="top"><h1>TLT / SCHD SCANNER</h1>
+<title>TLT scanner</title><style>{CSS}</style></head><body>
+<div class="top"><h1>TLT SCANNER</h1>
 <span class="muted">as of {esc(res['as_of'])}{src} · rendered {age}m ago ·
 <a href="/?refresh=1">refresh</a> · <a href="/api">json</a></span></div>
 <div class="grid">
@@ -235,9 +189,6 @@ def render(res: dict) -> str:
 {checks(ex['conditions'])}
 <p class="note">A close under <b>{esc(f"{ex['invalidation']:.2f}") if ex.get('invalidation') else '—'}</b> flips this to EXIT.</p>
 </section>
-
-<section class="card"><h2>SCHD — call timing overlay</h2>{schd_html}</section>
-{opt_html}
 
 <section class="card wide"><h2>What flips it</h2>
 <ul class="checks flips">{"".join(f"<li>{esc(f)}</li>" for f in plan['what_flips_it'])}</ul>
@@ -287,7 +238,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="local web dashboard for the TLT/SCHD scanner")
+    ap = argparse.ArgumentParser(description="local web dashboard for the TLT scanner")
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--lan", action="store_true", help="bind 0.0.0.0 so your phone can reach it")
     ap.add_argument("--refresh-min", type=int, default=15, help="cache/auto-reload minutes (default 15)")
@@ -295,10 +246,6 @@ def main() -> int:
     ap.add_argument("--account", type=float)
     ap.add_argument("--risk", type=float, default=1.0)
     ap.add_argument("--entry", type=float)
-    ap.add_argument("--schd-entry", type=float)
-    ap.add_argument("--schd-exit", choices=("swing", "reduce", "trend"), default="trend")
-    ap.add_argument("--options", action="store_true")
-    ap.add_argument("--options-source", choices=("schwab",), default="schwab")
     a = ap.parse_args()
     OPTS.update(vars(a))
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Capture a reproducible, fail-closed Schwab market-data snapshot.
 
-Downloads all daily history Schwab returns for /UB, SCHD, TLT and $TYX, plus
-the current ALL-side option chains for SCHD and TLT.  Exact JSON responses and
+Downloads all daily history Schwab returns for /UB, TLT and $TYX, plus
+the current ALL-side option chains for TLT.  Exact JSON responses and
 validated/scaled CSVs are kept together with hashes and a quality manifest.
 """
 from __future__ import annotations
@@ -21,12 +21,11 @@ ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data" / "schwab"
 HISTORIES = {
     "UB": {"symbol": "/UB", "scale_divisor": 1.0},
-    "SCHD": {"symbol": "SCHD", "scale_divisor": 1.0},
     "TLT": {"symbol": "TLT", "scale_divisor": 1.0},
     # Schwab's index bars are ten times the displayed percentage yield.
     "TYX": {"symbol": "$TYX", "scale_divisor": 10.0},
 }
-CHAINS = {"SCHD": "SCHD", "TLT": "TLT"}
+CHAINS = {"TLT": "TLT"}
 
 
 def canonical_bytes(payload: object) -> bytes:

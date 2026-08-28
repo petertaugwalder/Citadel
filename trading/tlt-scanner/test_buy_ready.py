@@ -80,19 +80,6 @@ class BuyReadySelectorTests(unittest.TestCase):
         self.assertNotIn("dte_out_of_range", out["rejection_counts"])
         self.assertEqual(out["preferences"]["days_to_expiry"], [50, 75])
 
-    def test_signal_controls_alert_not_selection(self):
-        qualified = {"source": "schwab", "contract_selected": True,
-                     "contract_qualified": True,
-                     "chain_health": {"ok": True}, "thresholds": {}}
-        with patch.object(sc, "pick_call", return_value=qualified):
-            off = ts.schd_options(35.0, entry_signal_confirmed=False)
-            on = ts.schd_options(35.0, entry_signal_confirmed=True)
-        self.assertTrue(off["recommendable"])
-        self.assertTrue(on["recommendable"])
-        self.assertFalse(off["alert_eligible"])
-        self.assertTrue(on["alert_eligible"])
-        self.assertEqual(on["buy_ready_status"], "TOP-RANKED")
-
     def test_atm_iv_uses_actual_nearest_strike_not_only_qualified_rows(self):
         qualified_itm = contract(strike=33.0, delta=.70, volatility=15.0)
         unqualified_atm = contract(strike=35.0, delta=.50, volatility=22.0)

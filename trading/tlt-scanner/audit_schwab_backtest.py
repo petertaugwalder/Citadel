@@ -27,7 +27,7 @@ def load_snapshot(path: str | None) -> tuple[Path, dict]:
 
 def load_frames(root: Path) -> dict[str, pd.DataFrame]:
     frames = {}
-    for name in ("UB", "SCHD", "TLT", "TYX"):
+    for name in ("UB", "TLT", "TYX"):
         raw = pd.read_csv(root / "ohlcv" / f"{name}.csv")
         idx = pd.to_datetime(raw.pop("date"))
         df = pd.DataFrame({
@@ -36,7 +36,6 @@ def load_frames(root: Path) -> dict[str, pd.DataFrame]:
             "Volume": raw["volume"].to_numpy(),
         }, index=idx)
         frames[name] = scanner.enrich(df)
-    frames["SCHD_PX"] = frames["SCHD"].copy()
     return frames
 
 
@@ -57,15 +56,8 @@ def main() -> int:
         fetched = fetched.replace(tzinfo=timezone.utc)
 
     tlt_bt = {f"variant_{v}": scanner.backtest(frames, variant=v) for v in (1, 2, 3, 4)}
-    schd_bt = {mode: scanner.backtest_schd(frames, exit_mode=mode)
-               for mode in ("swing", "reduce", "trend")}
     chains = {name: json.loads((root / "raw" / f"{name}_option_chain.json").read_text())
-              for name in ("SCHD", "TLT")}
-    schd_plan = scanner.schd_engine(frames)
-    production_schd_call = schwab.pick_call(
-        "SCHD", spot=float(frames["SCHD"]["Close"].iloc[-1]), now=fetched,
-        chain_data=chains["SCHD"],
-    )
+              for name in ("TLT",)}
     option_audit = {
         name: schwab.best_options(name, now=fetched, chain_data=chain)
         for name, chain in chains.items()
@@ -74,16 +66,11 @@ def main() -> int:
         "snapshot": root.name, "source": "Schwab Trader API only",
         "data_quality_status": manifest.get("data_quality_status"),
         "rejected_history_rows_total": manifest.get("rejected_history_rows_total", 0),
-        "underlying_backtests": {"TLT": tlt_bt, "SCHD": schd_bt},
+        "underlying_backtests": {"TLT": tlt_bt},
         "live_production_state": {
-            "SCHD_entry_signal_confirmed": schd_plan.get("entry_signal_confirmed", False),
-            "SCHD_action": schd_plan.get("action"),
-            "SCHD_call_contract_selector": production_schd_call,
         },
         "live_option_quality_audit": option_audit,
         "capability_matrix": {
-            "SCHD_CALL": "always top-ranked when executable chain data exists",
-            "SCHD_PUT": "always top-ranked when executable chain data exists",
             "TLT_CALL": "always top-ranked when executable chain data exists",
             "TLT_PUT": "always top-ranked when executable chain data exists",
         },
@@ -98,7 +85,7 @@ def main() -> int:
     path.write_text(json.dumps(report, indent=2, default=jsonify) + "\n")
     print(f"audit: {path}")
     print(f"verdict: {report['logic_verdict']}")
-    for ticker in ("SCHD", "TLT"):
+    for ticker in ("TLT",):
         for side in ("call", "put"):
             row = option_audit[ticker][side]
             if row.get("contract_selected"):

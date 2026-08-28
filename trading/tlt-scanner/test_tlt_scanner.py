@@ -44,9 +44,6 @@ class SchwabOnlyDataTests(unittest.TestCase):
         self.assertFalse(live)
         self.assertIn("unavailable", source)
 
-    def test_non_schwab_option_source_is_rejected(self):
-        self.assertIn("disabled", ts.schd_options(35.0, source="yfinance")["error"])
-
 
 if __name__ == "__main__":
     unittest.main()

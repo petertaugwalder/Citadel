@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-schwab_client.py — Schwab Trader API client for scanner histories and SCHD calls.
+schwab_client.py — Schwab Trader API client for scanner histories and TLT options.
 
-Schwab supplies every live market-data input: TLT, SCHD, /UB, $TYX, $TNX,
-plus real SCHD option greeks and two-sided quotes. Stdlib only.
+Schwab supplies every live market-data input: TLT, /UB, $TYX, $TNX,
+plus real TLT option greeks and two-sided quotes. Stdlib only.
 
 What this does NOT give you: historical option marks. Schwab serves the CURRENT
-chain only, so the SCHD backtest stays ETF-path timing. Nothing here measures
+chain only, so any option backtest stays ETF-path timing. Nothing here measures
 realised call P&L.
 
 Credentials (never committed, never pasted into chat):
@@ -22,8 +22,8 @@ Usage:
   python schwab_client.py login --manual   # fallback: paste the redirected URL yourself
   python schwab_client.py login --code '<redirected URL or bare code>'   # non-interactive
   python schwab_client.py status    # token age / expiry
-  python schwab_client.py quote SCHD
-  python schwab_client.py chain SCHD --side BOTH
+  python schwab_client.py quote TLT
+  python schwab_client.py chain TLT --side BOTH
   python schwab_client.py logout    # delete stored tokens
 """
 from __future__ import annotations
@@ -428,16 +428,16 @@ def doctor() -> None:
         return
 
     try:
-        q = quote("SCHD")
-        last = (q.get("SCHD", {}).get("quote", {}) or {}).get("lastPrice")
-        print(f"{ok} market data: SCHD quote returned (last {last})")
+        q = quote("TLT")
+        last = (q.get("TLT", {}).get("quote", {}) or {}).get("lastPrice")
+        print(f"{ok} market data: TLT quote returned (last {last})")
     except SchwabError as e:
         print(f"{fail} market data: {e}")
         print("      401/403 here usually means the app is not yet approved for Market Data")
         return
 
     try:
-        c = pick_call("SCHD")
+        c = pick_call("TLT")
         print(f"{ok} option chain: {c['expiry']} {c['strike']} call, delta {c['delta']}, OI {c['open_interest']}")
         print("\nall good — run:  python tlt_scanner.py --options")
     except SchwabError as e:
@@ -714,7 +714,7 @@ def pick_option(symbol: str, side: str, spot: float | None = None,
     }
 
 
-def pick_call(symbol: str = "SCHD", **kwargs) -> dict:
+def pick_call(symbol: str = "TLT", **kwargs) -> dict:
     return pick_option(symbol, "CALL", **kwargs)
 
 
@@ -751,9 +751,9 @@ def main() -> int:
         elif cmd == "logout":
             logout()
         elif cmd == "quote":
-            print(json.dumps(quote(args[1] if len(args) > 1 else "SCHD"), indent=2))
+            print(json.dumps(quote(args[1] if len(args) > 1 else "TLT"), indent=2))
         elif cmd == "chain":
-            sym = args[1] if len(args) > 1 and not args[1].startswith("-") else "SCHD"
+            sym = args[1] if len(args) > 1 and not args[1].startswith("-") else "TLT"
             min_dte = int(args[args.index("--min-dte") + 1]) if "--min-dte" in args else CALL_MIN_DTE
             max_dte = int(args[args.index("--max-dte") + 1]) if "--max-dte" in args else CALL_MAX_DTE
             target_dte = int(args[args.index("--target-dte") + 1]) if "--target-dte" in args else CALL_TARGET_DTE
