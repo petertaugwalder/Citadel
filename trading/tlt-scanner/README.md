@@ -229,6 +229,7 @@ python tlt_scanner.py --options
 
 - `tlt_scanner.py` — everything (single file, no project structure needed)
 - `test_price_basis.py` — locks the raw-levels / total-return-returns split
+- `test_fetch_shape.py` — locks the fetch/cache contract (raw OHLC + `TR`)
 - `requirements.txt` — pandas, numpy, rich
 
 ## Changelog
