@@ -4,10 +4,10 @@ Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 **UB futures** (Ultra T-Bond) and the **30y yield ($TYX)** as confirming tape.
 **The tape is the product; `--allocate` is an experimental allocator layered
 on top** (binary gate, details below).
-Tape rows: **TLT / UB / $TYX** (the duration triangle). Fetched quietly as a
-derived input, never shown as a row: **$TNX** (10s30s one-liner).
-Daily (end-of-day) histories and option chains come from the Schwab Trader API
-only and are cached locally. There is no alternate market-data vendor fallback.
+Tape rows: **TLT / UB / ^TYX** (the duration triangle). Nothing else is
+fetched — no curve leg, no fourth instrument, no derived series with a vote.
+Daily (end-of-day) bars come from Yahoo Finance via `yfinance` and are cached
+locally.
 Built for iTerm — rich TUI dashboard with a plain-ANSI fallback.
 
 > Decision support, not financial advice. Signals fire on daily closes; act the
@@ -75,9 +75,7 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
 divergence, and UB/TLT momentum disagreement (UB leads by hours).
 The aux inputs add display lines here: dated live duration (`D≈…` with the
 first-order Δy mapping), a dated cached value marked **STALE** with no implied
-P&L, or `UNAVAILABLE`; plus the 10s30s
-STEEPENING/FLATTENING one-liner. Only bear-steepening during an active
-bounce adds a CAUTION-class warning — never an EXIT, never a buy/sell
+P&L, or `UNAVAILABLE`. Display material only — never an EXIT, never a buy/sell
 boolean.
 
 ## Backtest verdicts (real data)
@@ -152,37 +150,6 @@ and "what flips it". Light/dark follow the OS; the layout collapses to one colum
 Numbers come from the identical `analyze()` call the CLI uses, cached for
 `--refresh-min` (default 15) with a manual **refresh** link.
 
-## Schwab connection (all live market data)
-
-The scanner uses Schwab's Trader API exclusively for TLT, `/UB`, `$TYX`,
-`$TNX`, and the TLT option chain. Missing Schwab data fails closed; it is never
-replaced with another vendor or a modeled option chain. **Credentials never
-live in this repo.**
-
-```bash
-# 1. Register an app at developer.schwab.com (Market Data API is enough for the
-#    call panel). Set the callback URL to exactly:  https://127.0.0.1:8182
-# 2. Put the credentials in your shell (or ~/.config/tlt-scanner/schwab.json, chmod 600):
-export SCHWAB_APP_KEY='...'
-export SCHWAB_APP_SECRET='...'
-# 3. One-time browser auth — prints a URL, you paste back the redirected URL:
-python schwab_client.py login
-python schwab_client.py status          # token ages
-python schwab_client.py chain TLT
-# 4. The scanner picks it up automatically:
-python tlt_scanner.py --options
-```
-
-- Access tokens last ~30 minutes and refresh automatically; **refresh tokens
-  last 7 days**, so `login` has to be re-run weekly. `status` tells you when.
-- Tokens are written to `~/.config/tlt-scanner/schwab_tokens.json` (chmod 600),
-  outside the repo. `schwab.json`, `schwab_tokens.json` and `.env` are
-  gitignored. `logout` deletes the stored tokens.
-- `--options-source schwab` is the only accepted source.
-- **What Schwab does not fix:** it serves the *current* chain only. There are
-  no historical option marks, so any option backtest stays ETF-path timing and
-  still measures no realised call P&L.
-
 ## Design notes / accepted tradeoffs
 
 - **Levels are raw prices; returns are total return.** Everything the scanner
@@ -196,10 +163,10 @@ python tlt_scanner.py --options
   the `TR` column, so buy-and-hold is measured as total return rather than
   flattered by leaving the dividend out. A cache written before this split
   stored adjusted closes as `Close`; it is rejected on sight and refetched.
-- **Duration math is first-order only.** Schwab does not publish issuer
-  Effective Duration. D-beta is therefore estimated from 63 sessions of
-  Schwab TLT returns versus Schwab $TYX yield changes, with sample size and
-  R² printed. It is an empirical sensitivity, not official fund duration.
+- **Duration math is first-order only.** D is read from the issuer's fund data
+  via `yfinance` and cached for a week. `TLT %chg ≈ -D × Δy` ignores convexity,
+  curve twist, distributions and NAV premium/discount, so realised moves will
+  not match the estimate. It is a cross-check line, never a buy/sell boolean.
 - **One market, three quotes.** Cash 30y yields, UB, and TLT co-move in
   overlapping hours; there is no strict causal chain. UB's edge is *hours*
   (Globex Sun 5pm CT–Fri 4pm CT, 1h daily halt): it discovers price while TLT
@@ -208,14 +175,11 @@ python tlt_scanner.py --options
   the closest listed futures to TLT's 20+y cash basket. Not a 1:1 clone —
   basis, cheapest-to-deliver, and conversion factors keep them close, not
   identical — but it is the tightest available proxy. A missing UB feed
-  degrades the scan like a missing $TYX; no substitute is invented.
-- **$TNX is not a watchlist ticker.** It is fetched privately only for the
-  10s30s display line (bear steepener = worse for TLT, bull flattener =
-  better) — there is no curve trade and no curve EXIT. $TYX remains the
-  single driver in the signal logic.
-- **Duration is displayed, used nowhere.** If the Schwab-only empirical beta
-  fails validation it displays unavailable; no issuer/Yahoo/constant fallback
-  is substituted. The residual it enables is a cross-check line only.
+  degrades the scan like a missing ^TYX; no substitute is invented.
+- **Duration is displayed, used nowhere.** It fails closed: with no live fetch
+  and no cache inside a week it prints `UNAVAILABLE` rather than falling back to
+  a constant, and a cached value is shown marked **STALE** but never drives the
+  implied-move line. The residual it enables is a cross-check line only.
 - **The exit rules are risk-management heuristics, not a validated edge.**
   The 15-day lookback is arbitrary, and RSI ≥ 70 will scratch some squeezes
   that keep running. They bound losses; they do not predict.
@@ -227,16 +191,21 @@ python tlt_scanner.py --options
 
 ## Files
 
-- `tlt_scanner.py` — everything (single file, no project structure needed)
+- `tlt_scanner.py` — the scanner (single file, no project structure needed)
+- `webapp.py` — local web dashboard over the same `analyze()` call
 - `test_price_basis.py` — locks the raw-levels / total-return-returns split
 - `test_fetch_shape.py` — locks the fetch/cache contract (raw OHLC + `TR`)
-- `requirements.txt` — pandas, numpy, rich
+- `test_tlt_scanner.py` — locks the duration contract (fails closed, never stale-as-live)
+- `requirements.txt` — pandas, numpy, yfinance, rich
 
 ## Changelog
 
 - ZB removed, UB only.
-- Schwab Trader API is the only live market-data source; all vendor/model fallbacks removed.
 - Local web dashboard (webapp.py): same engines, browser UI, /api JSON, phone-friendly.
 - SCHD removed entirely; the scanner is TLT / UB / ^TYX only.
 - Levels and signals moved to raw (unadjusted) prices so they match the chart;
   backtest returns now count distributions on both the strategy and buy-and-hold.
+- $TNX and the 10s30s curve line removed again (they had regressed back in as an
+  "aux input"); the scan is TLT / UB / ^TYX and nothing else.
+- Schwab client, dataset downloader, backtest audit and the option-chain selector
+  removed — leftovers of an abandoned migration that the scanner never imported.
