@@ -16,8 +16,10 @@ Three-layer model:
                 ^TNX is fetched quietly for the 10s30s one-liner only; it is not
                 required for a scan and is not a watchlist row.
 
-Data: Yahoo Finance daily bars via yfinance (cached locally). This is an end-of-day /
-swing tool, not an intraday one. Nothing here is financial advice.
+Data: Yahoo Finance daily bars via yfinance (cached locally). Levels and signals use
+raw (unadjusted) prices so they match the chart; distributions are counted only in
+--backtest returns. This is an end-of-day / swing tool, not an intraday one.
+Nothing here is financial advice.
 
 Usage:
   python tlt_scanner.py                 # one-shot scan, live data
@@ -87,6 +89,8 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
     """Attach every indicator series the analysis layers need."""
     out = df.copy()
+    if "TR" not in out.columns:  # demo/synthetic frames carry no distributions
+        out["TR"] = out["Close"]
     c = out["Close"]
     out["sma50"] = c.rolling(50).mean()
     out["sma200"] = c.rolling(200).mean()
@@ -135,7 +139,16 @@ def to_32nds(x: float) -> str:
 # ----------------------------------------------------------------------------- data layer
 
 
-def fetch_yahoo(symbol: str, auto_adjust: bool = True) -> pd.DataFrame | None:
+def fetch_yahoo(symbol: str) -> pd.DataFrame | None:
+    """Raw (unadjusted) OHLC plus a total-return column.
+
+    Every level the scanner prints or signals on is a raw price, so the 50/200-day
+    and the EMAs match the chart the trade is actually placed against. Dividend
+    back-adjustment would drag them low in proportion to the lookback -- on TLT's
+    ~4.2% distribution yield that is ~1.7% on the 200-day, enough to call a regime
+    flip more than a point early. The adjusted close is kept alongside as `TR` and
+    is used only to account for distributions in --backtest returns.
+    """
     import logging
 
     import yfinance as yf
@@ -143,9 +156,9 @@ def fetch_yahoo(symbol: str, auto_adjust: bool = True) -> pd.DataFrame | None:
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     try:
         df = yf.download(symbol, period=HISTORY_PERIOD, interval="1d",
-                         auto_adjust=auto_adjust, progress=False, threads=False)
+                         auto_adjust=False, progress=False, threads=False)
         if df is None or df.empty:
-            df = yf.Ticker(symbol).history(period=HISTORY_PERIOD, interval="1d", auto_adjust=auto_adjust)
+            df = yf.Ticker(symbol).history(period=HISTORY_PERIOD, interval="1d", auto_adjust=False)
     except Exception as exc:  # network / proxy / API failures degrade per-ticker
         print(f"  ! fetch failed for {symbol}: {exc}", file=sys.stderr)
         return None
@@ -153,14 +166,17 @@ def fetch_yahoo(symbol: str, auto_adjust: bool = True) -> pd.DataFrame | None:
         return None
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    df = df.rename(columns=str.title)
-    cols = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
+    df = df.rename(columns=str.title).rename(columns={"Adj Close": "TR"})
+    cols = [c for c in ("Open", "High", "Low", "Close", "TR") if c in df.columns]
     if "Close" not in cols:
         return None
     df = df[cols].dropna(subset=["Close"])
     for c in ("Open", "High", "Low"):
         if c not in df.columns:
             df[c] = df["Close"]
+    if "TR" not in df.columns:  # non-distributing series (yields, futures)
+        df["TR"] = df["Close"]
+    df["TR"] = df["TR"].ffill().fillna(df["Close"])
     df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
     return df
 
@@ -173,6 +189,8 @@ def load_frames(refresh: bool = False) -> dict[str, pd.DataFrame]:
         df = None
         if cache.exists() and not refresh and (time.time() - cache.stat().st_mtime) < CACHE_TTL_SEC:
             df = pd.read_csv(cache, index_col=0, parse_dates=True)
+            if "TR" not in df.columns:  # pre-raw-price cache: adjusted closes stored as Close
+                df = None
         if df is None or df.empty:
             df = fetch_yahoo(symbol)
             if df is not None:
@@ -688,6 +706,7 @@ def daily_state(frames: dict) -> pd.DataFrame:
     st = pd.DataFrame(index=idx)
     for col in ("Open", "High", "Low", "Close", "ema21", "sma50", "sma200", "rsi14", "chg1"):
         st[col] = tlt[col]
+    st["TR"] = tlt["TR"] if "TR" in tlt.columns else tlt["Close"]
 
     conds = pd.DataFrame(index=idx)
     conds["c1"] = tlt["ema9"] > tlt["ema21"]
@@ -795,6 +814,12 @@ def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str |
     if len(st) < 60:
         return {"error": f"only {len(st)} tradeable sessions after warmup/start filter"}
     opens, closes = st["Open"].astype(float), st["Close"].astype(float)
+    # Fills, levels and stops are raw prices (they must match the chart); returns are
+    # total return. `div[i]` is the extra return a holder earns on bar i from a
+    # distribution going ex -- the gap between the total-return step and the raw
+    # price step -- and is 0.0 on every other bar.
+    tr = st["TR"].astype(float)
+    div = ((tr / tr.shift(1)) / (closes / closes.shift(1)) - 1.0).fillna(0.0).to_numpy()
     n = len(st)
     rets = np.zeros(n)
     weights = np.zeros(n)
@@ -810,6 +835,7 @@ def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str |
                 new_w, reason = pending
                 o = opens.iloc[i]
                 rets[i] = (weight * (o / c_prev - 1) + new_w * (c / o - 1)
+                           + weight * div[i]
                            - abs(new_w - weight) * cost_bps / 1e4)
                 if weight == 0 and new_w > 0:
                     ep = {"entry_date": st.index[i], "entry_px": float(o), "cost_w": new_w * float(o),
@@ -831,7 +857,7 @@ def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str |
                 weight = new_w
                 pending = None
             else:
-                rets[i] = weight * (c / c_prev - 1)
+                rets[i] = weight * (c / c_prev - 1 + div[i])
         weights[i] = weight
 
         row = st.iloc[i]
@@ -881,8 +907,8 @@ def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str |
     gross_w = sum(e["pnl_pct"] for e in wins)
     gross_l = abs(sum(e["pnl_pct"] for e in losses))
     daily = pd.Series(rets)
-    bh = closes / closes.iloc[0]
-    bh_ret = pd.Series(closes).pct_change().fillna(0.0)
+    bh = tr / tr.iloc[0]
+    bh_ret = pd.Series(tr).pct_change().fillna(0.0)
 
     def max_dd(series):
         s = pd.Series(series)
