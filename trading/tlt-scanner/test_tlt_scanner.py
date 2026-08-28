@@ -1,49 +1,130 @@
+"""fetch_duration must fail closed and never present a cached value as live.
+
+Duration is the one input that converts a yield move into an expected TLT move,
+so a wrong or silently-stale D produces a confident, wrong number. The contract:
+only a value fetched during this scan sets is_live, a dated cache may be shown
+but never drives implied P&L, and anything else returns NaN rather than a
+fallback constant. The live fetch cannot be exercised offline, so these tests
+stand in for yfinance's fund-data object.
+"""
+import json
 import math
+import os
+import sys
+import tempfile
+import time
+import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-import numpy as np
 import pandas as pd
 
 import tlt_scanner as ts
 
 
-class SchwabOnlyDataTests(unittest.TestCase):
-    def test_schwab_yield_history_is_scaled_from_index_points(self):
-        payload = {"candles": [
-            {"datetime": 1_700_000_000_000, "open": 51.0, "high": 52.0,
-             "low": 50.0, "close": 51.5, "volume": 0},
-            {"datetime": 1_700_086_400_000, "open": 51.5, "high": 52.5,
-             "low": 51.0, "close": 52.0, "volume": 0},
-        ]}
-        with patch("schwab_client.price_history", return_value=payload):
-            df = ts.fetch_schwab("$TYX", scale=10.0)
-        self.assertIsNotNone(df)
-        self.assertAlmostEqual(float(df["Close"].iloc[-1]), 5.2)
+def holdings(duration: float) -> pd.DataFrame:
+    """The bond_holdings frame yfinance returns, duration on a labelled row."""
+    return pd.DataFrame({"TLT": [duration, 8.4]},
+                        index=["Effective Duration", "Effective Maturity"])
 
-    def test_empirical_duration_recovers_known_sensitivity(self):
-        idx = pd.bdate_range("2026-01-01", periods=80)
-        moves = np.array(([.02, -.03, .01, -.02, .04, -.01, .03, -.04] * 10)[:79])
-        yields = [5.0]
-        prices = [85.0]
-        for move in moves:
-            yields.append(yields[-1] + move)
-            prices.append(prices[-1] * (1 - 15.0 * move / 100.0))
-        frames = {
-            "TLT": pd.DataFrame({"Close": prices}, index=idx),
-            "TYX": pd.DataFrame({"Close": yields}, index=idx),
-        }
-        d, live, source = ts.fetch_duration(frames)
-        self.assertTrue(live)
-        self.assertAlmostEqual(d, 15.0, places=6)
-        self.assertIn("Schwab", source)
 
-    def test_duration_fails_closed_without_both_schwab_series(self):
-        d, live, source = ts.fetch_duration({})
+def fake_yf(bond_holdings=None, fails: bool = False):
+    """A stand-in yfinance module; fetch_duration imports it inside the function."""
+    mod = types.ModuleType("yfinance")
+
+    def ticker(symbol):
+        if fails:
+            raise RuntimeError("fund data endpoint unavailable")
+        return types.SimpleNamespace(
+            funds_data=types.SimpleNamespace(bond_holdings=bond_holdings))
+
+    mod.Ticker = ticker
+    return mod
+
+
+class DurationContractTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        p = patch.object(ts, "CACHE_DIR", self.cache_dir)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def write_cache(self, d, as_of="2026-08-26", age_days=0.0):
+        cache = self.cache_dir / "duration.json"
+        cache.write_text(json.dumps({"d": d, "as_of": as_of}))
+        if age_days:
+            old = time.time() - age_days * 86400
+            os.utime(cache, (old, old))
+        return cache
+
+    def fetch(self, refresh=False, bond_holdings=None, fails=False):
+        with patch.dict(sys.modules, {"yfinance": fake_yf(bond_holdings, fails)}):
+            return ts.fetch_duration(refresh=refresh)
+
+    def test_fails_closed_with_no_cache_and_no_live_source(self):
+        """No fallback constant: an unavailable D is NaN, not 15.0."""
+        d, live, source, as_of = self.fetch(refresh=True, fails=True)
         self.assertTrue(math.isnan(d))
         self.assertFalse(live)
-        self.assertIn("unavailable", source)
+        self.assertIsNone(as_of)
+        self.assertIn("no current or dated cached", source)
+
+    def test_live_fund_data_is_live_and_is_cached(self):
+        d, live, source, as_of = self.fetch(bond_holdings=holdings(14.96))
+        self.assertAlmostEqual(d, 14.96)
+        self.assertTrue(live)
+        self.assertIn("live", source)
+        self.assertEqual(as_of, pd.Timestamp.now(tz="UTC").date().isoformat())
+        payload = json.loads((self.cache_dir / "duration.json").read_text())
+        self.assertAlmostEqual(float(payload["d"]), 14.96)
+
+    def test_cached_value_is_shown_but_never_live(self):
+        """A dated cache is display material only -- is_live gates implied P&L."""
+        self.write_cache(14.96)
+        d, live, source, as_of = self.fetch(bond_holdings=holdings(15.40))
+        self.assertAlmostEqual(d, 14.96)
+        self.assertFalse(live)
+        self.assertIn("STALE", source)
+        self.assertEqual(as_of, "2026-08-26")
+
+    def test_refresh_bypasses_the_cache_and_reaches_the_live_source(self):
+        """--refresh is why a stale D can flip to live (or to UNAVAILABLE)."""
+        self.write_cache(14.96)
+        d, live, source, as_of = self.fetch(refresh=True, bond_holdings=holdings(15.40))
+        self.assertAlmostEqual(d, 15.40)
+        self.assertTrue(live)
+        self.assertIn("live", source)
+
+    def test_refresh_over_a_dead_source_reports_unavailable_not_the_cache(self):
+        """The failure the tape actually shows: --refresh + a dead endpoint."""
+        self.write_cache(14.96)
+        d, live, _source, _as_of = self.fetch(refresh=True, fails=True)
+        self.assertTrue(math.isnan(d))
+        self.assertFalse(live)
+
+    def test_cache_older_than_a_week_is_not_used(self):
+        self.write_cache(14.96, age_days=8)
+        d, live, _source, _as_of = self.fetch(fails=True)
+        self.assertTrue(math.isnan(d))
+        self.assertFalse(live)
+
+    def test_out_of_band_values_are_rejected(self):
+        """5 < D < 30 -- a parse that lands on maturity or a percentage is not D."""
+        for bad in (0.0, 4.9, 30.0, 104.0):
+            with self.subTest(bad=bad):
+                d, live, _source, _as_of = self.fetch(bond_holdings=holdings(bad))
+                self.assertTrue(math.isnan(d))
+                self.assertFalse(live)
+
+    def test_corrupt_cache_does_not_crash_the_scan(self):
+        (self.cache_dir / "duration.json").write_text("{not json")
+        d, live, _source, _as_of = self.fetch(fails=True)
+        self.assertTrue(math.isnan(d))
+        self.assertFalse(live)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
