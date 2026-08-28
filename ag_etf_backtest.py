@@ -13,7 +13,9 @@
 #                         commission, slippage (plus book + unadjusted raw price)
 #           weights.csv   daily actual (drifted) weights per ticker + CASH
 #           equity.csv    date, strategy, ew4, DBA, WEAT, CORN, SOYB, CANE
-#           metrics.csv   every book x {TRAIN, TEST, FULL} performance table
+#           metrics.csv   every book x {TRAIN, TEST, FULL, CALENDAR_<year>,
+#                         REGIME_*, FULL_2019_TO_LATEST}; snake_case columns,
+#                         alias_of tags windows that duplicate another
 #           figs/equity_curves.png, drawdowns.png, rolling_12m_return.png,
 #           figs/weights_area.png
 # NOTE:     All books share one engine, one calendar, one cost model. Signals are
@@ -62,7 +64,25 @@ START_CAPITAL: float = 100_000.0
 FFILL_LIMIT: int = 5        # forward-fill at most 5 sessions
 TZ: str = "America/New_York"
 TRADING_DAYS: int = 252
+# Denominator for the return standard deviation behind vol, Sharpe and Sortino.
+# 0 = population std, which is what the reference pipeline uses and what makes
+# these figures reconcile with it to float precision; 1 = sample std, the more
+# common textbook estimator. They differ by a relative 1/(2n) -- about 3 bps of
+# a 28% vol over a 2000-day sample, so the choice is a reporting convention, not
+# an economic one.
+STD_DDOF: int = 0
 WEIGHT_TOL: float = 1e-9    # treat |w| below this as flat
+
+# Human-readable book labels and the metrics column schema below both mirror the
+# reference pipeline's metrics.csv, so rows from the two can be diffed directly.
+PORTFOLIO_LABELS: Dict[str, str] = {"STRATEGY": "Strategy", "EW4": "EW four-pack"}
+
+# Regime windows carried over from the reference pipeline. Clipped to the sample.
+REGIMES: List[Tuple[str, str, str]] = [
+    ("REGIME_2019", "2019-01-01", "2019-12-31"),
+    ("REGIME_2020_2021", "2020-01-01", "2021-12-31"),
+    ("REGIME_2022_TO_LATEST", "2022-01-01", "2100-01-01"),
+]
 
 _WARNINGS: List[str] = []
 _WARN_COUNTS: Dict[str, int] = {}
@@ -589,7 +609,7 @@ def perf_metrics(book: Dict[str, object], period: str, lo: pd.Timestamp,
     r = r[(r.index >= lo) & (r.index <= hi)]
     eq = eq_full[(eq_full.index >= lo) & (eq_full.index <= hi)]
     if len(r) < 2:
-        return {"period": period}
+        return {"period": period, "start": None, "end": None}
 
     n = len(r)
     total = float((1.0 + r).prod() - 1.0)
@@ -604,7 +624,7 @@ def perf_metrics(book: Dict[str, object], period: str, lo: pd.Timestamp,
     cagr = (1.0 + total) ** (1.0 / cal_years) - 1.0 if cal_years > 0 else np.nan
 
     # Vol/Sharpe/Sortino annualise on 252 trading days, as specified.
-    sd = float(r.std(ddof=1))
+    sd = float(r.std(ddof=STD_DDOF))
     vol = sd * np.sqrt(TRADING_DAYS)
     sharpe = float(r.mean() / sd * np.sqrt(TRADING_DAYS)) if sd > 0 else np.nan
     # Sortino uses the textbook downside deviation (Sortino & Price): the RMS of
@@ -616,7 +636,9 @@ def perf_metrics(book: Dict[str, object], period: str, lo: pd.Timestamp,
     calmar = cagr / abs(mdd) if mdd and mdd < 0 else np.nan
 
     monthly = (1.0 + r).groupby(r.index.to_period("M")).prod() - 1.0
-    hit = float((monthly > 0).mean() * 100.0) if len(monthly) else np.nan
+    # Stored as a FRACTION (0.68), matching the reference pipeline's column of
+    # the same name, and rendered as a percent in the terminal table.
+    hit = float((monthly > 0).mean()) if len(monthly) else np.nan
 
     # Turnover: one-way = 0.5 * sum|dw| per rebalance, annualised over the window.
     w = book["weights"]
@@ -629,23 +651,55 @@ def perf_metrics(book: Dict[str, object], period: str, lo: pd.Timestamp,
     one_way = float((tr["notional"].to_numpy() / eq_at).sum() / 2.0) if len(tr) else 0.0
     turnover = one_way / cal_years if cal_years > 0 else np.nan
 
-    # Average holdings counts risk positions: every ticker column except the
-    # cash proxy and the residual CASH column (so DBA buy-and-hold reads 1.00).
+    # Two holdings counts, because they answer different questions:
+    #   avg_holdings        every risk position, so a DBA-only book reads 1.00
+    #   avg_sleeve_holdings sleeves only - the reference pipeline's convention,
+    #                       under which a benchmark-only book reads 0.00
     wwin = w[(w.index >= lo) & (w.index <= hi)]
     risk = [c for c in wwin.columns if c not in ("CASH", CASH_PROXY)]
     avg_hold = float((wwin[risk].abs() > WEIGHT_TOL).sum(axis=1).mean())
+    sl = [c for c in wwin.columns if c in SLEEVES]
+    avg_sleeve = float((wwin[sl].abs() > WEIGHT_TOL).sum(axis=1).mean())
     cost = book["costs"]
     cost_usd = float(cost[(cost.index >= lo) & (cost.index <= hi)].sum())
 
-    return {"period": period, "CAGR": cagr, "TotalReturn": total, "Vol": vol,
-            "Sharpe": sharpe, "Sortino": sortino, "MaxDD": mdd, "Calmar": calmar,
-            "HitMonths%": hit, "TurnoverAnn": turnover, "AvgHoldings": avg_hold,
-            "CostDrag$": cost_usd, "Months": int(len(monthly)), "Days": n,
-            "CalYears": cal_years}
+    return {"period": period, "start": eq.index[0].date(), "end": eq.index[-1].date(),
+            "cagr": cagr, "total_return": total, "vol_ann": vol,
+            "sharpe_rf0": sharpe, "sortino": sortino, "max_drawdown": mdd,
+            "calmar": calmar, "hit_months_pct": hit, "turnover_ann": turnover,
+            "avg_holdings": avg_hold, "avg_sleeve_holdings": avg_sleeve,
+            "total_cost_drag_usd": cost_usd, "months": int(len(monthly)),
+            "days": n, "cal_years": cal_years}
 
 
-_METRIC_COLS = ["CAGR", "TotalReturn", "Vol", "Sharpe", "Sortino", "MaxDD",
-                "Calmar", "HitMonths%", "TurnoverAnn", "AvgHoldings", "CostDrag$"]
+_METRIC_COLS = ["cagr", "total_return", "vol_ann", "sharpe_rf0", "sortino",
+                "max_drawdown", "calmar", "hit_months_pct", "turnover_ann",
+                "avg_holdings", "avg_sleeve_holdings", "total_cost_drag_usd"]
+
+
+def build_periods(lo: pd.Timestamp, hi: pd.Timestamp, train_end: pd.Timestamp
+                  ) -> List[Tuple[str, pd.Timestamp, pd.Timestamp]]:
+    """TRAIN/TEST/FULL as specified, plus calendar years and the reference
+    pipeline's regimes. Windows are clipped to the sample; empty ones are
+    dropped. Duplicates are kept (so a lookup by either name works) but tagged
+    with alias_of downstream, since e.g. TEST and FULL_2019_TO_LATEST are the
+    same window whenever TRAIN_END is the last session of 2018."""
+    ps: List[Tuple[str, pd.Timestamp, pd.Timestamp]] = [
+        ("TRAIN", lo, min(train_end, hi)),
+        ("TEST", train_end + pd.Timedelta(days=1), hi),
+        ("FULL", lo, hi)]
+    for y in range(lo.year, hi.year + 1):
+        a, b = max(lo, pd.Timestamp(f"{y}-01-01")), min(hi, pd.Timestamp(f"{y}-12-31"))
+        if a <= b:
+            ps.append((f"CALENDAR_{y}", a, b))
+    for nm, a0, b0 in REGIMES:
+        a, b = max(lo, pd.Timestamp(a0)), min(hi, pd.Timestamp(b0))
+        if a <= b:
+            ps.append((nm, a, b))
+    a = max(lo, pd.Timestamp("2019-01-01"))
+    if a <= hi:
+        ps.append(("FULL_2019_TO_LATEST", a, hi))
+    return [(n, a, b) for n, a, b in ps if a <= b]
 
 
 def print_metrics_table(df: pd.DataFrame, period: str) -> None:
@@ -653,17 +707,17 @@ def print_metrics_table(df: pd.DataFrame, period: str) -> None:
     if sub.empty:
         print(f"  (no data for {period})")
         return
-    hdr = (f"{'book':<12}{'CAGR':>8}{'TotRet':>10}{'Vol':>8}{'Sharpe':>8}"
+    hdr = (f"{'portfolio':<19}{'CAGR':>8}{'TotRet':>10}{'Vol':>8}{'Sharpe':>8}"
            f"{'Sortino':>9}{'MaxDD':>8}{'Calmar':>8}{'Hit%':>7}{'Turn':>7}"
            f"{'Hold':>6}{'Cost$':>10}")
     print(hdr)
     print("-" * len(hdr))
     for _, row in sub.iterrows():
-        print(f"{row['book']:<12}{row['CAGR']:>7.2%} {row['TotalReturn']:>9.2%} "
-              f"{row['Vol']:>7.2%} {row['Sharpe']:>8.2f} {row['Sortino']:>9.2f} "
-              f"{row['MaxDD']:>7.2%} {row['Calmar']:>8.2f} {row['HitMonths%']:>6.1f} "
-              f"{row['TurnoverAnn']:>6.2f} {row['AvgHoldings']:>6.2f} "
-              f"{row['CostDrag$']:>9,.0f}")
+        print(f"{row['portfolio']:<19}{row['cagr']:>7.2%} {row['total_return']:>9.2%} "
+              f"{row['vol_ann']:>7.2%} {row['sharpe_rf0']:>8.2f} {row['sortino']:>9.2f} "
+              f"{row['max_drawdown']:>7.2%} {row['calmar']:>8.2f} "
+              f"{row['hit_months_pct'] * 100:>6.1f} {row['turnover_ann']:>6.2f} "
+              f"{row['avg_holdings']:>6.2f} {row['total_cost_drag_usd']:>9,.0f}")
 
 
 # =============================================================================
@@ -800,15 +854,34 @@ def main() -> None:
         books[f"{t}_BH"] = run_book(f"{t}_BH", lambda d, tk=t: buy_hold_weights(tk),
                                     cal, panel, schedule, use_cash_proxy)
 
+    periods = build_periods(lo, hi, train_end)
     rows = []
     for key, bk in books.items():
-        for period, a, b in (("TRAIN", lo, train_end), ("TEST", train_end + pd.Timedelta(days=1), hi), ("FULL", lo, hi)):
+        label = PORTFOLIO_LABELS.get(key, key.replace("_BH", " buy-and-hold"))
+        for period, a, b in periods:
             m = perf_metrics(bk, period, a, b, use_cash_proxy)
-            m["book"] = key
+            m["portfolio"], m["book"] = label, key
             rows.append(m)
     metrics = pd.DataFrame(rows)
-    metrics = metrics[["book", "period"] + _METRIC_COLS
-                      + ["Months", "Days", "CalYears"]]
+
+    # Two period names can resolve to the same window (TEST and
+    # FULL_2019_TO_LATEST whenever TRAIN_END ends 2018; CALENDAR_2019 and
+    # REGIME_2019). Both rows are kept so a lookup by either name works, but the
+    # later one is tagged so a consumer can drop redundant rows with
+    # metrics[metrics.alias_of.isna()].
+    seen: Dict[Tuple[object, object], str] = {}
+    alias = []
+    for _, row in metrics.iterrows():
+        k = (row["start"], row["end"])
+        canon = seen.get(k)
+        if canon is None or canon == row["period"]:
+            seen.setdefault(k, row["period"])
+            alias.append(pd.NA)
+        else:
+            alias.append(canon)
+    metrics["alias_of"] = alias
+    metrics = metrics[["portfolio", "book", "period", "start", "end"]
+                      + _METRIC_COLS + ["months", "days", "cal_years", "alias_of"]]
 
     for period, label in (("TRAIN", f"TRAIN  {lo.date()} -> {train_end.date()}"),
                           ("TEST", f"TEST   {(train_end + pd.Timedelta(days=1)).date()} -> {hi.date()}"),
@@ -816,16 +889,54 @@ def main() -> None:
         rule(label)
         print_metrics_table(metrics, period)
     print("""
-  Definitions. CAGR compounds TotalReturn over calendar years (365.25 days) of
-  the span the window's returns cover, so TRAIN and TEST chain-link to FULL
+  Definitions. Vol/Sharpe/Sortino use ddof=0 for the return std. CAGR compounds
+  total_return over calendar years (365.25 days) of the span the window's
+  returns cover, so TRAIN and TEST chain-link to FULL
   exactly. Vol, Sharpe and Sortino annualise on 252 trading days with rf = 0.
   Sortino divides by the textbook downside deviation sqrt(mean(min(r,0)^2))
   taken over EVERY observation, not the std of the negative subset. MaxDD runs
   from the window's own high-water mark. Turnover is annualised one-way, i.e.
   traded notional / equity at the fill, halved, divided by calendar years.
-  AvgHoldings counts risk positions and excludes cash and the cash proxy, so a
-  single-name buy-and-hold book reads 1.00. Cost$ is realised commission plus
-  slippage inside the window, so it scales with the book's size at the time.""")
+  hit_months_pct is stored as a fraction. avg_holdings counts every risk
+  position, so a single-name buy-and-hold book reads 1.00; avg_sleeve_holdings
+  counts sleeves only, under which a benchmark-only book reads 0.00. Cost is
+  realised commission plus slippage inside the window, so it scales with the
+  book's size at the time.""")
+
+    # ---- strategy vs the passive alternatives, per period --------------------
+    rule("STRATEGY vs PASSIVE, BY PERIOD")
+    piv = metrics.pivot_table(index="period", columns="book", values="cagr")
+    extra = [n for n, _, _ in periods if n not in ("TRAIN", "TEST", "FULL")]
+    order = ["TRAIN", "TEST", "FULL"] + extra
+    print(f"  {'period':<24}{'strategy':>10}{'ew4':>10}{'DBA':>10}"
+          f"{'vs DBA':>10}{'  best single (ex-post)':<24}")
+    print("  " + "-" * 86)
+    wins = tot = 0
+    for per in order:
+        if per not in piv.index:
+            continue
+        row = piv.loc[per]
+        bench = row.get(BENCHMARK + "_BH", np.nan)
+        singles = {k: row[k] for k in row.index
+                   if k.endswith("_BH") and k != BENCHMARK + "_BH" and pd.notna(row[k])}
+        best = max(singles, key=singles.get) if singles else None
+        alias = not metrics[metrics.period == per]["alias_of"].isna().all()
+        # The verdict is against DBA, the designated benchmark. The best single
+        # name is shown for context only - it is picked with hindsight, so it is
+        # not a bar any live strategy could have been held to.
+        edge = row["STRATEGY"] - bench if pd.notna(bench) else np.nan
+        if pd.notna(edge) and not alias:
+            tot += 1
+            wins += edge >= 0
+        print(f"  {per + (' *' if alias else ''):<24}{row['STRATEGY']:>9.2%} "
+              f"{row.get('EW4', np.nan):>9.2%} {bench:>9.2%} "
+              f"{('+' if edge >= 0 else '') + format(edge, '.1%'):>9}  "
+              f"{(best.replace('_BH', '') + ' ' + format(singles[best], '.1%')) if best else '':<22}")
+    print(f"\n  Strategy beat the {BENCHMARK} benchmark in {wins} of {tot} distinct periods. "
+          f"'*' marks a\n  window that duplicates another (see alias_of in metrics.csv); those are\n"
+          f"  excluded from the tally. 'best single' is the strongest sleeve in that\n"
+          f"  window chosen after the fact - context, not a bar the rotation could\n"
+          f"  have been held to live.")
 
     # ---- 10 worst strategy months --------------------------------------------
     rule("10 WORST STRATEGY MONTHS")
