@@ -469,6 +469,18 @@ def macro_checks(frames: dict, aux: dict) -> list[str]:
     return notes
 
 
+def first_target_note(levels: dict, regime: str) -> str:
+    """Describe the existing first target without changing target or risk math."""
+    r_first = levels.get("r_to_first_target")
+    if r_first is None:
+        return ""
+    if r_first < 0.5 and levels.get("first_target_is_sma50"):
+        regime_note = "overhead supply in a bear regime — " if regime == "BEARISH" else ""
+        return (f"{r_first}R to 50-day — mean-reversion back to the 50-day ceiling; "
+                f"{regime_note}not a full swing target")
+    return f"first target = {r_first}R"
+
+
 def action_and_levels(frames: dict, res: dict, account: float | None, risk_pct: float) -> dict:
     tlt = frames["TLT"]
     close = _last(tlt, "Close")
