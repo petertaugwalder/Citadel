@@ -20,6 +20,8 @@ cd trading/tlt-scanner
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
+python schwab_client.py login     # one-time browser auth; re-run weekly
+
 python tlt_scanner.py             # one-shot scan (live data)
 python tlt_scanner.py --explain   # the trading logic, in the terminal
 ```
@@ -82,12 +84,10 @@ boolean.
 
 ## Backtest verdicts (real data)
 
-> **Stale as of the raw-price/total-return split.** Both figures below were
-> computed price-only on both sides: dividend-adjusted bars for the strategy and
-> a price-only buy-and-hold. Returns now count distributions, which lifts
-> buy-and-hold by the full stream and the strategy by only its exposure-weighted
-> share — so the gap against holding TLT **widens**. Re-run `--backtest` for
-> current numbers; the shape of the conclusion does not change.
+> **Stale — different data source.** The figures below came from
+> dividend-adjusted Yahoo bars. The scanner now reads raw Schwab prints, so both
+> the levels and the return series differ. Re-run `--backtest` for current
+> numbers; the shape of the conclusion does not change.
 
 **TLT, full history 2010-10-25 → 2026-08-27** (3984 sessions, 1bp/side):
 strategy **+8.93%** (max DD −33.13%, Sharpe 0.10) vs buy-and-hold **+28.88%**
@@ -185,17 +185,20 @@ python tlt_scanner.py --options
 
 ## Design notes / accepted tradeoffs
 
-- **Levels are raw prices; returns are total return.** Everything the scanner
-  prints or signals on -- the 50/200-day, the EMAs, stops, targets, the
-  invalidation price -- is an unadjusted price, so it matches the chart the
-  trade is placed against. Dividend back-adjustment drags a moving average low
-  in proportion to its lookback: on TLT's ~4.2% distribution yield that is
-  ~1.7% on the 200-day (~1.4 points), enough to call a regime flip more than a
-  point before any chart shows it. `--backtest` keeps the same raw bars for
-  entries, exits and stops, and accounts for distributions separately through
-  the `TR` column, so buy-and-hold is measured as total return rather than
-  flattered by leaving the dividend out. A cache written before this split
-  stored adjusted closes as `Close`; it is rejected on sight and refetched.
+- **Levels are raw prices.** Everything the scanner prints or signals on -- the
+  50/200-day, the EMAs, stops, targets, the invalidation price -- is an
+  unadjusted print, so it matches the chart the trade is placed against.
+  Dividend back-adjustment drags a moving average low in proportion to its
+  lookback: on TLT's ~4.2% distribution yield that is ~1.7% on the 200-day
+  (~1.4 points), enough to call a regime flip more than a point before any chart
+  shows it. Schwab serves raw prints, so this is what arrives.
+- **Returns are price-only, and the backtest says so.** Schwab publishes no
+  adjusted close and no historical distribution series, so the `TR` column
+  equals `Close` and `--backtest` measures price return on **both** the strategy
+  and buy-and-hold. That understates holding TLT by its entire dividend stream —
+  a caveat line states this on every run rather than passing price return off as
+  total return. The plumbing for real total return is intact: give `TR` a
+  genuine total-return series and both sides pick it up automatically.
 - **Duration math is first-order only.** Schwab does not publish issuer
   Effective Duration. D-beta is therefore estimated from 63 sessions of
   Schwab TLT returns versus Schwab $TYX yield changes, with sample size and
@@ -228,8 +231,9 @@ python tlt_scanner.py --options
 ## Files
 
 - `tlt_scanner.py` — everything (single file, no project structure needed)
-- `test_price_basis.py` — locks the raw-levels / total-return-returns split
-- `test_fetch_shape.py` — locks the fetch/cache contract (raw OHLC + `TR`)
+- `schwab_client.py` — Schwab OAuth, price history, option chains
+- `test_price_basis.py` — locks the raw-levels / distribution-accounting split
+- `test_fetch_shape.py` — locks the Schwab fetch/cache contract (raw OHLC + `TR`)
 - `requirements.txt` — pandas, numpy, rich
 
 ## Changelog
@@ -238,5 +242,7 @@ python tlt_scanner.py --options
 - Schwab Trader API is the only live market-data source; all vendor/model fallbacks removed.
 - Local web dashboard (webapp.py): same engines, browser UI, /api JSON, phone-friendly.
 - SCHD removed entirely; the scanner is TLT / UB / ^TYX only.
-- Levels and signals moved to raw (unadjusted) prices so they match the chart;
-  backtest returns now count distributions on both the strategy and buy-and-hold.
+- Levels and signals moved to raw (unadjusted) prices so they match the chart.
+- Market data switched to the Schwab Trader API; yfinance removed entirely.
+  Duration is now an empirical TLT/$TYX beta fitted from the Schwab tape, and
+  backtest returns are price-only because Schwab publishes no adjusted close.

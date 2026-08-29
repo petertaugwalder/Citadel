@@ -1,12 +1,9 @@
-"""fetch_yahoo must return raw OHLC and a separate total-return column.
+"""fetch_schwab must return raw OHLC in displayed units, and fail closed.
 
-The live fetch cannot be exercised offline, so these tests feed fetch_yahoo the
-response shapes yfinance actually produces (MultiIndex from download(), flat from
-Ticker.history(), and a series with no Adj Close) and assert the raw/TR split
-survives each one.
+The live API cannot be reached offline, so these feed fetch_schwab the payload
+shape Schwab actually returns and assert the parsing, unit scaling and failure
+behaviour. Also covers the on-disk cache contract.
 """
-import sys
-import types
 import unittest
 from unittest.mock import patch
 
@@ -15,133 +12,95 @@ import pandas as pd
 
 import tlt_scanner as ts
 
-DAYS = 120
-IDX = pd.bdate_range("2026-01-02", periods=DAYS, tz="America/New_York")
+DAY_MS = 86_400_000
+START_MS = 1_700_000_000_000
 
 
-def raw_and_adjusted(dividend_every=21, rate=0.0035):
-    """A raw OHLC frame plus the Adj Close yfinance would pair with it."""
-    close = pd.Series(np.linspace(90.0, 100.0, DAYS), index=IDX)
-    d = pd.Series(0.0, index=IDX)
-    d.iloc[dividend_every::dividend_every] = rate
-    # back-adjustment: older bars scaled down by the distributions still to come
-    factor = (1.0 + d).cumprod()
-    factor = factor / factor.iloc[-1]
-    frame = pd.DataFrame({
-        "Open": close * 0.995, "High": close * 1.01,
-        "Low": close * 0.99, "Close": close,
-        "Adj Close": close * factor, "Volume": 1_000_000,
-    }, index=IDX)
-    return frame, factor
+def candles(n=120, first=90.0, step=0.05, scale=1.0):
+    """A Schwab pricehistory payload, quoted in the instrument's native units."""
+    rows = []
+    for i in range(n):
+        close = (first + i * step) * scale
+        rows.append({
+            "datetime": START_MS + i * DAY_MS,
+            "open": close * 0.995, "high": close * 1.01,
+            "low": close * 0.99, "close": close, "volume": 1_000_000,
+        })
+    return {"candles": rows}
 
 
-def fake_yf(download_frame, history_frame=None):
-    """A stand-in yfinance module; fetch_yahoo imports it inside the function."""
-    mod = types.ModuleType("yfinance")
-    mod.download = lambda *a, **k: download_frame
-    mod.Ticker = lambda symbol: types.SimpleNamespace(
-        history=lambda *a, **k: history_frame)
-    return mod
+class FetchSchwabTests(unittest.TestCase):
+    def fetch(self, payload, symbol="TLT", scale=1.0):
+        with patch("schwab_client.price_history", return_value=payload):
+            return ts.fetch_schwab(symbol, scale)
 
-
-class FetchShapeTests(unittest.TestCase):
-    def fetch(self, download_frame, history_frame=None):
-        with patch.dict(sys.modules,
-                        {"yfinance": fake_yf(download_frame, history_frame)}):
-            return ts.fetch_yahoo("TLT")
-
-    def test_multiindex_download_keeps_raw_close_and_tr(self):
-        """download() returns (Price, Ticker) columns for a single ticker."""
-        frame, factor = raw_and_adjusted()
-        mi = frame.copy()
-        mi.columns = pd.MultiIndex.from_product([frame.columns, ["TLT"]])
-        out = self.fetch(mi)
-
+    def test_parses_ohlc_and_sets_tr_to_close(self):
+        out = self.fetch(candles())
         self.assertIsNotNone(out)
-        self.assertIn("TR", out.columns)
-        self.assertEqual(len(out), DAYS)
-        # Close is the raw print, untouched by back-adjustment
-        np.testing.assert_allclose(out["Close"].to_numpy(),
-                                   frame["Close"].to_numpy(), rtol=1e-12)
-        # TR carries the adjustment, and only TR
-        np.testing.assert_allclose(out["TR"].to_numpy(),
-                                   frame["Adj Close"].to_numpy(), rtol=1e-12)
-        self.assertLess(out["TR"].iloc[0], out["Close"].iloc[0])
-        self.assertAlmostEqual(out["TR"].iloc[-1], out["Close"].iloc[-1], places=6)
+        self.assertEqual(len(out), 120)
+        for col in ("Open", "High", "Low", "Close", "TR"):
+            self.assertIn(col, out.columns)
+        # Schwab publishes no adjusted close, so TR must mirror Close exactly
+        np.testing.assert_allclose(out["TR"].to_numpy(), out["Close"].to_numpy(), rtol=0)
 
-    def test_raw_ohlc_is_not_scaled(self):
-        """Open/High/Low must be raw too -- the backtest fills at the open."""
-        frame, _ = raw_and_adjusted()
-        mi = frame.copy()
-        mi.columns = pd.MultiIndex.from_product([frame.columns, ["TLT"]])
-        out = self.fetch(mi)
-        for col in ("Open", "High", "Low"):
-            np.testing.assert_allclose(out[col].to_numpy(),
-                                       frame[col].to_numpy(), rtol=1e-12)
+    def test_yield_index_points_are_scaled(self):
+        """$TYX arrives in index points: 52.0 is a 5.20% yield."""
+        out = self.fetch(candles(n=30, first=5.15, step=0.001, scale=10.0),
+                         symbol="$TYX", scale=10.0)
+        self.assertAlmostEqual(float(out["Close"].iloc[0]), 5.15, places=6)
+        self.assertLess(float(out["Close"].max()), 10.0)
 
-    def test_flat_history_fallback(self):
-        """Empty download() falls through to Ticker.history(), flat columns."""
-        frame, _ = raw_and_adjusted()
-        out = self.fetch(pd.DataFrame(), frame)
-        self.assertIsNotNone(out)
-        np.testing.assert_allclose(out["Close"].to_numpy(),
-                                   frame["Close"].to_numpy(), rtol=1e-12)
-        np.testing.assert_allclose(out["TR"].to_numpy(),
-                                   frame["Adj Close"].to_numpy(), rtol=1e-12)
+    def test_prices_are_not_scaled(self):
+        out = self.fetch(candles(n=10, first=83.0, step=0.0))
+        self.assertAlmostEqual(float(out["Close"].iloc[0]), 83.0, places=6)
 
-    def test_missing_adj_close_falls_back_to_price_only(self):
-        """Yields and futures have no distributions; TR must equal Close."""
-        frame, _ = raw_and_adjusted()
-        out = self.fetch(frame.drop(columns=["Adj Close"]))
-        self.assertIsNotNone(out)
-        np.testing.assert_allclose(out["TR"].to_numpy(),
-                                   out["Close"].to_numpy(), rtol=1e-12)
-
-    def test_index_is_naive_and_normalised(self):
-        frame, _ = raw_and_adjusted()
-        out = self.fetch(frame)
+    def test_index_is_naive_normalised_and_sorted(self):
+        payload = candles(n=10)
+        payload["candles"].reverse()
+        out = self.fetch(payload)
         self.assertIsNone(out.index.tz)
         self.assertTrue((out.index == out.index.normalize()).all())
+        self.assertTrue(out.index.is_monotonic_increasing)
 
-    def test_fetch_failure_returns_none(self):
-        """A blocked or failing fetch must fail closed, not half-populate."""
-        mod = types.ModuleType("yfinance")
-        def boom(*a, **k):
-            raise RuntimeError("CONNECT tunnel failed, response 403")
-        mod.download = boom
-        mod.Ticker = lambda s: types.SimpleNamespace(history=boom)
-        with patch.dict(sys.modules, {"yfinance": mod}):
-            self.assertIsNone(ts.fetch_yahoo("TLT"))
+    def test_duplicate_sessions_collapse(self):
+        payload = candles(n=5)
+        payload["candles"].append(dict(payload["candles"][-1], close=999.0))
+        out = self.fetch(payload)
+        self.assertEqual(len(out), 5)
+        self.assertAlmostEqual(float(out["Close"].iloc[-1]), 999.0, places=6)
+
+    def test_empty_and_malformed_payloads_return_none(self):
+        self.assertIsNone(self.fetch({"candles": []}))
+        self.assertIsNone(self.fetch({}))
+        self.assertIsNone(self.fetch({"candles": [{"datetime": START_MS, "close": 1.0}]}))
+
+    def test_api_failure_fails_closed(self):
+        with patch("schwab_client.price_history",
+                   side_effect=RuntimeError("GET /pricehistory failed (401)")):
+            self.assertIsNone(ts.fetch_schwab("TLT"))
 
 
 class CacheTests(unittest.TestCase):
-    """The cache must carry TR, and must reject caches written before the split."""
-
-    def setUp(self):
-        self.frame, _ = raw_and_adjusted()
-        self.calls = 0
-
-    def _module(self):
-        def download(*a, **k):
-            self.calls += 1
-            return self.frame
-        mod = types.ModuleType("yfinance")
-        mod.download = download
-        mod.Ticker = lambda s: types.SimpleNamespace(
-            history=lambda *a, **k: self.frame)
-        return mod
+    """The cache must carry TR, and reject caches written before the raw split."""
 
     def test_tr_survives_cache_and_legacy_cache_is_refetched(self):
         import tempfile
         from pathlib import Path
 
+        calls = {"n": 0}
+
+        def price_history(symbol, start_ms, end_ms):
+            calls["n"] += 1
+            return candles()
+
         with tempfile.TemporaryDirectory() as td, \
                 patch.object(ts, "CACHE_DIR", Path(td)), \
-                patch.dict(sys.modules, {"yfinance": self._module()}):
+                patch("schwab_client.price_history", side_effect=price_history):
             first = ts.load_frames()
-            after_first = self.calls
+            after_first = calls["n"]
+            self.assertGreater(after_first, 0)
             ts.load_frames()
-            self.assertEqual(self.calls, after_first, "second load should hit the cache")
+            self.assertEqual(calls["n"], after_first, "second load should hit the cache")
 
             cached = pd.read_csv(Path(td) / "TLT.csv", index_col=0, parse_dates=True)
             self.assertIn("TR", cached.columns)
@@ -149,11 +108,11 @@ class CacheTests(unittest.TestCase):
                                        first["TLT"]["TR"].to_numpy(), rtol=1e-12)
 
             for csv in Path(td).glob("*.csv"):
-                df = pd.read_csv(csv, index_col=0, parse_dates=True).drop(columns=["TR"])
-                df.to_csv(csv)
-            before = self.calls
+                pd.read_csv(csv, index_col=0, parse_dates=True) \
+                    .drop(columns=["TR"]).to_csv(csv)
+            before = calls["n"]
             again = ts.load_frames()
-            self.assertGreater(self.calls, before, "a cache without TR must be refetched")
+            self.assertGreater(calls["n"], before, "a cache without TR must be refetched")
             self.assertIn("TR", again["TLT"].columns)
 
 

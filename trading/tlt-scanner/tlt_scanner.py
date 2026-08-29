@@ -16,10 +16,10 @@ Three-layer model:
                 ^TNX is fetched quietly for the 10s30s one-liner only; it is not
                 required for a scan and is not a watchlist row.
 
-Data: Yahoo Finance daily bars via yfinance (cached locally). Levels and signals use
-raw (unadjusted) prices so they match the chart; distributions are counted only in
---backtest returns. This is an end-of-day / swing tool, not an intraday one.
-Nothing here is financial advice.
+Data: Schwab Trader API daily bars (cached locally); run `python schwab_client.py login`
+once first. Schwab serves raw (unadjusted) prints, so levels and signals match the chart.
+It publishes no adjusted close, so --backtest returns are price-only and say so.
+This is an end-of-day / swing tool, not an intraday one. Nothing here is financial advice.
 
 Usage:
   python tlt_scanner.py                 # one-shot scan, live data
@@ -47,18 +47,20 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
+# Schwab symbol and the divisor that turns its quote into displayed units.
+# Schwab serves yield indices in index points ($TYX 52.0 == 5.20%), prices as-is.
 TICKERS = {  # the watchlist — the only rows shown on the tape
-    "TLT": "TLT",     # duration leg: 20+yr Treasury ETF, traded on the stack/bounce engine
-    "UB": "UB=F",     # Ultra Bond futures: primary futures tape (25y+ basket, tightest match to TLT's book)
-    "TYX": "^TYX",    # 30y yield index (drives TLT, inverted)
+    "TLT": ("TLT", 1.0),    # duration leg: 20+yr Treasury ETF, traded on the stack/bounce engine
+    "UB": ("/UB", 1.0),     # Ultra Bond futures: primary futures tape (25y+ basket, tightest match to TLT's book)
+    "TYX": ("$TYX", 10.0),  # 30y yield index (drives TLT, inverted)
 }
 AUX_TICKERS = {  # fetched quietly as derived inputs — never shown as watchlist rows,
                  # never required: a scan runs fine with any or all of these missing
-    "TNX": "^TNX",   # 10y yield: private input for the 10s30s display one-liner (no curve trade)
+    "TNX": ("$TNX", 10.0),  # 10y yield: private input for the 10s30s display one-liner (no curve trade)
 }
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
-HISTORY_PERIOD = "max"  # full history: EMAs/RSI converge regardless, and --backtest --from 2020-01-01 needs it
+HISTORY_YEARS = 20  # Schwab pricehistory takes a date range; 20y covers TLT's whole listed life
 
 # ----------------------------------------------------------------------------- indicators
 
@@ -139,52 +141,51 @@ def to_32nds(x: float) -> str:
 # ----------------------------------------------------------------------------- data layer
 
 
-def fetch_yahoo(symbol: str) -> pd.DataFrame | None:
-    """Raw (unadjusted) OHLC plus a total-return column.
+def fetch_schwab(symbol: str, scale: float = 1.0) -> pd.DataFrame | None:
+    """Daily OHLC from the Schwab Trader API, in displayed units.
 
-    Every level the scanner prints or signals on is a raw price, so the 50/200-day
-    and the EMAs match the chart the trade is actually placed against. Dividend
-    back-adjustment would drag them low in proportion to the lookback -- on TLT's
-    ~4.2% distribution yield that is ~1.7% on the 200-day, enough to call a regime
-    flip more than a point early. The adjusted close is kept alongside as `TR` and
-    is used only to account for distributions in --backtest returns.
+    Schwab serves raw (unadjusted) prints, which is what every level the scanner
+    signals on needs — the 50/200-day and the EMAs match the chart the trade is
+    placed against. It publishes no adjusted close, so TR is set equal to Close
+    and --backtest returns are price-only; the backtest says so in its caveats
+    rather than passing price return off as total return.
+
+    `scale` divides the quote into displayed units: yield indices arrive in index
+    points ($TYX 52.0 == 5.20%), prices arrive as-is.
     """
-    import logging
+    import schwab_client
 
-    import yfinance as yf
-
-    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - int(HISTORY_YEARS * 365.25 * 86400 * 1000)
     try:
-        df = yf.download(symbol, period=HISTORY_PERIOD, interval="1d",
-                         auto_adjust=False, progress=False, threads=False)
-        if df is None or df.empty:
-            df = yf.Ticker(symbol).history(period=HISTORY_PERIOD, interval="1d", auto_adjust=False)
-    except Exception as exc:  # network / proxy / API failures degrade per-ticker
-        print(f"  ! fetch failed for {symbol}: {exc}", file=sys.stderr)
+        payload = schwab_client.price_history(symbol, start_ms, end_ms)
+    except Exception as exc:  # auth / network / API failures degrade per-ticker
+        print(f"  ! Schwab fetch failed for {symbol}: {exc}", file=sys.stderr)
         return None
-    if df is None or df.empty:
+    candles = (payload or {}).get("candles") or []
+    if not candles:
         return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.rename(columns=str.title).rename(columns={"Adj Close": "TR"})
-    cols = [c for c in ("Open", "High", "Low", "Close", "TR") if c in df.columns]
-    if "Close" not in cols:
+    df = pd.DataFrame(candles)
+    need = {"datetime", "open", "high", "low", "close"}
+    if not need.issubset(df.columns):
+        print(f"  ! Schwab payload for {symbol} missing OHLC fields", file=sys.stderr)
         return None
-    df = df[cols].dropna(subset=["Close"])
-    for c in ("Open", "High", "Low"):
-        if c not in df.columns:
-            df[c] = df["Close"]
-    if "TR" not in df.columns:  # non-distributing series (yields, futures)
-        df["TR"] = df["Close"]
-    df["TR"] = df["TR"].ffill().fillna(df["Close"])
-    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-    return df
+    out = pd.DataFrame({
+        "Open": df["open"].astype(float) / scale,
+        "High": df["high"].astype(float) / scale,
+        "Low": df["low"].astype(float) / scale,
+        "Close": df["close"].astype(float) / scale,
+    })
+    out.index = pd.to_datetime(df["datetime"].astype("int64"), unit="ms").dt.normalize()
+    out = out[~out.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+    out["TR"] = out["Close"]  # Schwab publishes no adjusted close
+    return out if len(out) else None
 
 
 def load_frames(refresh: bool = False) -> dict[str, pd.DataFrame]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     frames: dict[str, pd.DataFrame] = {}
-    for name, symbol in {**TICKERS, **AUX_TICKERS}.items():
+    for name, (symbol, scale) in {**TICKERS, **AUX_TICKERS}.items():
         cache = CACHE_DIR / f"{name}.csv"
         df = None
         if cache.exists() and not refresh and (time.time() - cache.stat().st_mtime) < CACHE_TTL_SEC:
@@ -192,7 +193,7 @@ def load_frames(refresh: bool = False) -> dict[str, pd.DataFrame]:
             if "TR" not in df.columns:  # pre-raw-price cache: adjusted closes stored as Close
                 df = None
         if df is None or df.empty:
-            df = fetch_yahoo(symbol)
+            df = fetch_schwab(symbol, scale)
             if df is not None:
                 df.to_csv(cache)
             elif cache.exists():
@@ -240,48 +241,42 @@ def demo_frames() -> dict[str, pd.DataFrame]:
     return {k: enrich(_demo_walk(rng, n, s, seg, v)) for k, (s, seg, v) in shapes.items()}
 
 
-def fetch_duration(refresh: bool = False) -> tuple[float, bool, str, str | None]:
-    """Return a dated TLT effective duration without inventing a fallback.
+def fetch_duration(frames: dict) -> tuple[float, bool, str]:
+    """TLT duration estimated from the tape, or nothing at all.
 
-    Only a value fetched during this scan is allowed to drive duration-implied
-    P&L. A dated cache may still be displayed for context, but is marked stale
-    and deliberately returns ``is_live=False``.
+    Schwab publishes no issuer Effective Duration, and no other vendor is
+    substituted. What it does serve is TLT and $TYX, so duration is recovered as
+    the empirical sensitivity linking them: dP/P = -D x dy, fitted by least
+    squares over the recent overlap. That is a measured beta, not official fund
+    duration, and it is display-only — no signal reads it.
+
+    Fails closed: without both series it returns NaN and says so.
     """
-    cache = CACHE_DIR / "duration.json"
-    try:
-        if cache.exists() and not refresh and (time.time() - cache.stat().st_mtime) < 7 * 86400:
-            payload = json.loads(cache.read_text())
-            d = float(payload["d"])
-            if 5 < d < 30:
-                as_of = payload.get("as_of") or time.strftime(
-                    "%Y-%m-%d", time.localtime(cache.stat().st_mtime)
-                )
-                return d, False, "cached fund data — STALE", as_of
-    except Exception:
-        pass
-    try:
-        import logging
+    tlt, tyx = frames.get("TLT"), frames.get("TYX")
+    if tlt is None or tyx is None or "Close" not in tlt or "Close" not in tyx:
+        return float("nan"), False, "unavailable (Schwab TLT/$TYX pair not loaded)"
 
-        import yfinance as yf
+    window = 63  # a quarter of sessions: long enough to fit, short enough to stay current
+    ret = tlt["Close"].astype(float).pct_change()
+    dy = tyx["Close"].astype(float).diff()
+    pair = pd.concat([ret, dy], axis=1, keys=["ret", "dy"]).dropna()
+    pair = pair[pair["dy"] != 0].tail(window)
+    if len(pair) < 20:
+        return float("nan"), False, "unavailable (too few overlapping TLT/$TYX sessions)"
 
-        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-        bh = yf.Ticker("TLT").funds_data.bond_holdings
-        row = None
-        for label in bh.index:
-            if "duration" in str(label).lower():
-                row = bh.loc[label]
-                break
-        if row is not None:
-            for v in row:
-                d = float(v)
-                if 5 < d < 30:
-                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    as_of = pd.Timestamp.now(tz="UTC").date().isoformat()
-                    cache.write_text(json.dumps({"d": d, "as_of": as_of}))
-                    return d, True, "live fund data", as_of
-    except Exception:
-        pass
-    return float("nan"), False, "no current or dated cached TLT effective duration", None
+    x, y = pair["dy"].to_numpy(), pair["ret"].to_numpy()
+    var = float(((x - x.mean()) ** 2).sum())
+    if var <= 0:
+        return float("nan"), False, "unavailable (no 30y yield variation to fit)"
+    beta = float(((x - x.mean()) * (y - y.mean())).sum() / var)
+    d = -beta * 100.0  # dy is in percentage points; duration is per 100bp
+    resid = y - (y.mean() + beta * (x - x.mean()))
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - float((resid ** 2).sum()) / ss_tot if ss_tot > 0 else float("nan")
+    if not (5 < d < 30):
+        return (float("nan"), False,
+                f"unavailable (fitted D={d:.1f} outside a credible 5-30 range)")
+    return d, True, f"Schwab {len(pair)}-session empirical beta, n={len(pair)}, R²={r2:.2f}"
 
 
 # ----------------------------------------------------------------------------- analysis
@@ -952,7 +947,10 @@ def backtest(frames: dict, cost_bps: float = 1.0, variant: int = 1, start: str |
         "IN-SAMPLE: these rules were designed while looking at this same period — results are descriptive, not predictive",
         "signals form on close T, fills at open T+1; no intraday stops (a gap through the stop fills at the open)",
         f"costs {cost_bps} bps per side on weight changes; no slippage model beyond that; no taxes",
-        "dividend-adjusted prices: strategy and buy-and-hold both include distributions",
+        ("raw prices with no distribution data on this feed: strategy and buy-and-hold "
+         "returns are BOTH price-only and understate holding TLT by its dividend stream"
+         if float((tr / closes).max() - (tr / closes).min()) < 1e-9 else
+         "raw prices for levels; strategy and buy-and-hold returns both include distributions"),
         f"one instrument over {years:.1f} years and {len(closed)} closed trades — "
         f"treat every stat as noisy, and note the regime mix in that window",
     ]
@@ -1530,8 +1528,8 @@ def main() -> int:
         if "TLT" not in frames:
             print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
             return None, None
-        dur = ((float("nan"), False, "demo data has no effective duration", None)
-               if args.demo else fetch_duration(refresh=force))
+        dur = ((float("nan"), False, "demo data has no effective duration")
+               if args.demo else fetch_duration(frames))
         res = analyze(frames, account=args.account, risk_pct=args.risk, entry=args.entry, duration=dur)
         if args.allocate:
             res["allocator"] = allocator_snapshot(frames)
