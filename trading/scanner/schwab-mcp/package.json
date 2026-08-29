@@ -1,0 +1,16 @@
+{
+  "name": "schwab-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing Schwab Trader API market data — quotes, price history, option chains",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "selftest": "node server.js --selftest",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "zod": "^3.25.0"
+  },
+  "engines": { "node": ">=18" }
+}
