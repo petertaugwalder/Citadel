@@ -4,8 +4,8 @@ Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 **UB futures** (Ultra T-Bond) and the **30y yield ($TYX)** as confirming tape.
 **The tape is the product; `--allocate` is an experimental allocator layered
 on top** (binary gate, details below).
-Tape rows: **TLT / UB / $TYX** (the duration triangle). Fetched quietly as a
-derived input, never shown as a row: **$TNX** (10s30s one-liner).
+Tape rows: **TLT / UB / $TYX** (the duration triangle) — nothing else is
+fetched.
 Daily (end-of-day) histories come from **Yahoo Finance by default** — free, no
 account, no login. `--source schwab` switches to the Schwab Trader API once you
 have logged in; option chains are Schwab-only. Caches are per-provider.
@@ -77,10 +77,8 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
 divergence, and UB/TLT momentum disagreement (UB leads by hours).
 The aux inputs add display lines here: dated live duration (`D≈…` with the
 first-order Δy mapping), a dated cached value marked **STALE** with no implied
-P&L, or `UNAVAILABLE`; plus the 10s30s
-STEEPENING/FLATTENING one-liner. Only bear-steepening during an active
-bounce adds a CAUTION-class warning — never an EXIT, never a buy/sell
-boolean.
+P&L, or `UNAVAILABLE`. These are display lines only — never an EXIT,
+never a buy/sell boolean.
 
 ## Backtest verdicts (real data)
 
@@ -154,7 +152,7 @@ Numbers come from the identical `analyze()` call the CLI uses, cached for
 ## Schwab connection (all live market data)
 
 The scanner uses Schwab's Trader API exclusively for TLT, `/UB`, `$TYX`,
-`$TNX`, and the TLT option chain. Missing Schwab data fails closed; it is never
+and the TLT option chain. Missing Schwab data fails closed; it is never
 replaced with another vendor or a modeled option chain. **Credentials never
 live in this repo.**
 
@@ -214,10 +212,10 @@ python tlt_scanner.py --options
   basis, cheapest-to-deliver, and conversion factors keep them close, not
   identical — but it is the tightest available proxy. A missing UB feed
   degrades the scan like a missing $TYX; no substitute is invented.
-- **$TNX is not a watchlist ticker.** It is fetched privately only for the
-  10s30s display line (bear steepener = worse for TLT, bull flattener =
-  better) — there is no curve trade and no curve EXIT. $TYX remains the
-  single driver in the signal logic.
+- **No curve input.** The 10y leg and the 10s30s line are gone; $TYX is the
+  single yield driver in the signal logic. Removing them changed no entry or
+  exit rule — the curve only ever raised a CAUTION warning, so a backtest
+  across the same window reproduces bit-identically.
 - **Duration is displayed, used nowhere.** If the Schwab-only empirical beta
   fails validation it displays unavailable; no issuer/Yahoo/constant fallback
   is substituted. The residual it enables is a cross-check line only.
@@ -244,6 +242,7 @@ python tlt_scanner.py --options
 - Schwab Trader API is the only live market-data source; all vendor/model fallbacks removed.
 - Local web dashboard (webapp.py): same engines, browser UI, /api JSON, phone-friendly.
 - SCHD removed entirely; the scanner is TLT / UB / ^TYX only.
+- $TNX and the 10s30s curve check removed; three tickers, no curve input.
 - Levels and signals moved to raw (unadjusted) prices so they match the chart.
 - Market data is provider-switchable via `--source`, defaulting to Yahoo (free,
   no login); `--source schwab` uses the Trader API. Duration is an empirical

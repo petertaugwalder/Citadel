@@ -13,8 +13,6 @@ Three-layer model:
                               at least one TLT-native box: SCOUT >= 3, CONFIRMED >= 5,
                               REGIME FLIP = close over the 200-day.
   3. CROSS-CHECKS — futures/cash divergence and yield-exhaustion divergence.
-                ^TNX is fetched quietly for the 10s30s one-liner only; it is not
-                required for a scan and is not a watchlist row.
 
 Data: Schwab Trader API daily bars (cached locally); run `python schwab_client.py login`
 once first. Schwab serves raw (unadjusted) prints, so levels and signals match the chart.
@@ -54,10 +52,6 @@ TICKERS = {  # the watchlist — the only rows shown on the tape
     "TLT": {"yahoo": ("TLT", 1.0), "schwab": ("TLT", 1.0)},     # duration leg: 20+yr Treasury ETF
     "UB": {"yahoo": ("UB=F", 1.0), "schwab": ("/UB", 1.0)},     # Ultra Bond futures (25y+ basket)
     "TYX": {"yahoo": ("^TYX", 1.0), "schwab": ("$TYX", 10.0)},  # 30y yield (drives TLT, inverted)
-}
-AUX_TICKERS = {  # fetched quietly as derived inputs — never shown as watchlist rows,
-                 # never required: a scan runs fine with any or all of these missing
-    "TNX": {"yahoo": ("^TNX", 1.0), "schwab": ("$TNX", 10.0)},  # 10y: private 10s30s input only
 }
 SOURCES = ("yahoo", "schwab")
 DEFAULT_SOURCE = "yahoo"  # free and unauthenticated; Schwab needs a weekly login
@@ -235,7 +229,7 @@ def load_frames(refresh: bool = False, source: str = DEFAULT_SOURCE) -> dict[str
     cache_dir = CACHE_DIR / source
     cache_dir.mkdir(parents=True, exist_ok=True)
     frames: dict[str, pd.DataFrame] = {}
-    for name, per_source in {**TICKERS, **AUX_TICKERS}.items():
+    for name, per_source in TICKERS.items():
         symbol, scale = per_source[source]
         cache = cache_dir / f"{name}.csv"
         df = None
@@ -287,7 +281,6 @@ def demo_frames() -> dict[str, pd.DataFrame]:
         "TLT": (102.0, [(0.55, -0.13), (0.25, -0.05), (0.17, -0.055), (0.03, 0.028)], 0.0055),
         "TYX": (4.10, [(0.55, 0.16), (0.25, 0.05), (0.17, 0.055), (0.03, -0.021)], 0.0065),
         "UB": (135.0, [(0.55, -0.12), (0.25, -0.05), (0.17, -0.05), (0.03, 0.015)], 0.0050),
-        "TNX": (3.90, [(0.55, 0.13), (0.25, 0.03), (0.17, 0.032), (0.03, -0.012)], 0.0060),
     }
     return {k: enrich(_demo_walk(rng, n, s, seg, v)) for k, (s, seg, v) in shapes.items()}
 
@@ -479,7 +472,7 @@ def aux_metrics(frames: dict, duration: tuple) -> dict:
     d_val, d_live = duration[:2]
     d_source = duration[2] if len(duration) > 2 else ("live source" if d_live else "undated fallback — STALE")
     d_as_of = duration[3] if len(duration) > 3 else None
-    tlt, tyx, tnx = frames.get("TLT"), frames.get("TYX"), frames.get("TNX")
+    tlt, tyx = frames.get("TLT"), frames.get("TYX")
     out: dict = {"duration": {
         "D": round(d_val, 2), "live": bool(d_live), "source": d_source, "as_of": d_as_of,
     }}
@@ -493,16 +486,6 @@ def aux_metrics(frames: dict, duration: tuple) -> dict:
         actual5 = float(tlt["Close"].iloc[-1] / tlt["Close"].iloc[-6] - 1) * 100
         out["residual"] = {"implied_5d_pct": round(implied5, 2), "actual_5d_pct": round(actual5, 2),
                            "residual_pct": round(actual5 - implied5, 2)}
-    if tyx is not None and tnx is not None:
-        spread = (tyx["Close"] - tnx["Close"].reindex(tyx.index).ffill()).dropna()
-        if len(spread) >= 6:
-            bp = float(spread.iloc[-1]) * 100
-            d5 = float(spread.iloc[-1] - spread.iloc[-6]) * 100
-            label = "STEEPENING" if d5 > 3 else "FLATTENING" if d5 < -3 else "FLAT"
-            y_up5 = float(tyx["Close"].iloc[-1] - tyx["Close"].iloc[-6]) > 0
-            out["curve"] = {"spread_bp": round(bp, 0), "chg5_bp": round(d5, 0), "label": label,
-                            "bear_steepener": bool(d5 > 3 and y_up5),
-                            "bull_flattener": bool(d5 < -3 and not y_up5)}
     return out
 
 
@@ -522,14 +505,6 @@ def macro_checks(frames: dict, aux: dict) -> list[str]:
         side = "lagging" if res["residual_pct"] < 0 else "running ahead of"
         notes.append(f"Residual (cross-check only): TLT {side} the duration-implied move over 5d "
                      f"(actual {res['actual_5d_pct']:+.2f}% vs implied {res['implied_5d_pct']:+.2f}%)")
-    c = aux.get("curve")
-    if c is not None:
-        line = f"Curve (display only): 10s30s {c['spread_bp']:.0f}bp ({c['chg5_bp']:+.0f}bp/5d) — {c['label']}"
-        if c["bear_steepener"]:
-            line += " | bear steepener, worse for TLT"
-        elif c["bull_flattener"]:
-            line += " | bull flattener, better for TLT"
-        notes.append(line)
     return notes
 
 
@@ -648,8 +623,6 @@ def exit_engine(frames: dict, res: dict, entry: float | None, aux: dict) -> dict
         bear_div = (float(highs.iloc[-1]) > float(highs.iloc[-2])
                     and float(tlt["rsi14"].loc[d2]) < float(tlt["rsi14"].loc[d1]))
     add("warn", "Bearish divergence: higher TLT high on weaker RSI — rally exhausting", bear_div)
-    add("warn", "Bear-steepening curve while the bounce is on — this tape kills rallies early",
-        aux.get("curve", {}).get("bear_steepener", False) and res["bounce"]["active"])
 
     exits = [c for c in conds if c["kind"] == "exit" and c["on"]]
     trims = [c for c in conds if c["kind"] == "trim" and c["on"]]
@@ -1428,14 +1401,6 @@ Why three instruments (one market, three quotes):
   TLT               - what you can actually buy; where entries/stops live.
   A missing UB feed degrades the scan exactly like a missing ^TYX: the
   affected conditions read n/a and no substitute is invented.
-
-Not on the watchlist, fetched quietly as derived inputs (either may be missing
-  and the scan still runs; neither has a buy/sell boolean or an EXIT rule):
-  ^TNX (10y yield) - only to print the 10s30s one-liner. There is no curve
-    trade: bear steepeners (yields up, 10s30s wider) are the worse tape for
-    TLT, bull flatteners (yields down, tighter) the better one, and the one
-    coded consequence is a CAUTION-class warning when bear-steepening
-    coincides with an active bounce.
 
 Layer 1 - REGIME (should you even be hunting longs?)
   Moving-average structure (price vs 50d/200d, 50d slope, 50d vs 200d) scored
