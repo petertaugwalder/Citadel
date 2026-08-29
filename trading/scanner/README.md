@@ -101,6 +101,27 @@ writes summary/monthly/yearly/seasonality CSVs for a spreadsheet. Seasonal
 averages over ~15 observations per month are suggestive, not predictive — read
 the hit rate next to the average before trusting either.
 
+### Running it where the network can't reach Yahoo
+
+Split the fetch from the analysis. On a machine that can reach Yahoo:
+
+```
+node backtest.js --dump bars.csv
+node backtest.js --dump bars.csv --monthly
+```
+
+`--dump` saves the raw bars it fetched (`ticker,date,close`). Daily is ~21k rows
+(~600 KB); `--monthly` keeps month-end closes only, ~1k rows (~25 KB), small
+enough to hand around. Then anywhere, with no network:
+
+```
+node backtest.js --load bars.csv
+```
+
+Every section runs identically off the file. Month-end input is detected from the
+bar spacing: volatility is then annualized from monthly returns, and high, low and
+drawdown are month-end extremes rather than intraday.
+
 ## Data source & caveats
 
 Quotes come from Yahoo Finance's public chart endpoint (no API key). It is

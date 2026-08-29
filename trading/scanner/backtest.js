@@ -20,6 +20,13 @@
  *   node backtest.js --from 2010-01-01     restrict the window
  *   node backtest.js --csv ./out           also write CSVs for a spreadsheet
  *   node backtest.js --check               offline self-test, exit 0/1
+ *
+ * Where the network can't reach Yahoo, split it in two: run --dump on a machine
+ * that can, then run every section offline from that file.
+ *
+ *   node backtest.js --dump bars.csv       fetch and save raw bars, then report
+ *   node backtest.js --dump bars.csv --monthly   month-end closes only (small)
+ *   node backtest.js --load bars.csv       report from a saved file, no network
  */
 'use strict';
 
@@ -169,7 +176,18 @@ function maxDrawdown(bars) {
   return { pct: worst, from, to };
 }
 
-function annualizedVol(bars) {
+// Median spacing between bars, so a month-end file is not annualized as daily.
+function periodsPerYear(bars) {
+  if (bars.length < 3) return 252;
+  const gaps = [];
+  for (let i = 1; i < bars.length; i++) {
+    gaps.push((new Date(bars[i].date) - new Date(bars[i - 1].date)) / 864e5);
+  }
+  gaps.sort((a, b) => a - b);
+  return gaps[Math.floor(gaps.length / 2)] > 20 ? 12 : 252;
+}
+
+function annualizedVol(bars, ppy = null) {
   if (bars.length < 30) return null;
   const rets = [];
   for (let i = 1; i < bars.length; i++) {
@@ -177,7 +195,7 @@ function annualizedVol(bars) {
   }
   const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
   const varr = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (rets.length - 1);
-  return Math.sqrt(varr) * Math.sqrt(252) * 100;
+  return Math.sqrt(varr) * Math.sqrt(ppy ?? periodsPerYear(bars)) * 100;
 }
 
 function summarize(sym, bars) {
@@ -435,6 +453,38 @@ function writeCsvs(dir, data) {
   ]);
 }
 
+// ── dump / load ─────────────────────────────────────────────────────────────
+
+function dumpBars(file, data, monthly) {
+  const rows = ['ticker,date,close'];
+  for (const { sym, bars } of data) {
+    const use = monthly ? monthEnds(bars) : bars;
+    for (const b of use) rows.push(`${sym},${b.date},${b.close.toFixed(6)}`);
+  }
+  fs.writeFileSync(file, rows.join('\n') + '\n');
+  console.log(paint(`\nWrote ${rows.length - 1} ${monthly ? 'month-end' : 'daily'} bars to ${file}`, C.dim));
+  console.log(paint(`Re-run the full report anywhere with:  node backtest.js --load ${file}`, C.dim));
+}
+
+function loadBars(file) {
+  const lines = fs.readFileSync(file, 'utf8').trim().split(/\r?\n/);
+  if (!/^ticker\s*,\s*date\s*,\s*close/i.test(lines[0])) {
+    throw new Error(`${file}: expected a "ticker,date,close" header`);
+  }
+  const bySym = new Map();
+  for (let i = 1; i < lines.length; i++) {
+    const [sym, date, close] = lines[i].split(',').map((x) => (x ?? '').trim());
+    const px = Number(close);
+    if (!sym || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(px) || px <= 0) {
+      throw new Error(`${file}: bad row ${i + 1}: ${lines[i]}`);
+    }
+    if (!bySym.has(sym)) bySym.set(sym, []);
+    bySym.get(sym).push({ date, close: px });
+  }
+  for (const bars of bySym.values()) bars.sort((a, b) => a.date.localeCompare(b.date));
+  return bySym;
+}
+
 // ── self-test ───────────────────────────────────────────────────────────────
 
 function runCheck() {
@@ -510,6 +560,34 @@ function runCheck() {
   t('no overlap -> null',
     correlate(a, [bar('1999-01-01', 5), bar('1999-01-02', 6)]) === null);
 
+  console.log('dump / load round trip');
+  const tmp = path.join(require('node:os').tmpdir(), `bt-check-${process.pid}.csv`);
+  const rt = [
+    { sym: 'AAA', bars: [bar('2020-01-02', 10), bar('2020-01-31', 11), bar('2020-02-28', 12)] },
+    { sym: 'BBB', bars: [bar('2020-01-02', 5), bar('2020-01-31', 6), bar('2020-02-28', 7)] },
+  ];
+  dumpBars(tmp, rt, false);
+  const back = loadBars(tmp);
+  t('round trip keeps both tickers', back.size === 2 && back.get('AAA').length === 3);
+  t('round trip keeps values', approx(back.get('BBB')[2].close, 7, 1e-5));
+  dumpBars(tmp, rt, true);
+  const monthly = loadBars(tmp);
+  t('monthly dump keeps month ends only', monthly.get('AAA').length === 2 &&
+    monthly.get('AAA')[0].date === '2020-01-31');
+  fs.writeFileSync(tmp, 'ticker,date,close\nAAA,2020-13-99,x\n');
+  let threw = false;
+  try { loadBars(tmp); } catch { threw = true; }
+  t('bad row rejected', threw);
+  fs.writeFileSync(tmp, 'a,b,c\n1,2,3\n');
+  threw = false;
+  try { loadBars(tmp); } catch { threw = true; }
+  t('wrong header rejected', threw);
+  fs.unlinkSync(tmp);
+  t('daily spacing detected', periodsPerYear([bar('2020-01-01', 1), bar('2020-01-02', 1),
+    bar('2020-01-03', 1)]) === 252);
+  t('monthly spacing detected', periodsPerYear([bar('2020-01-31', 1), bar('2020-02-29', 1),
+    bar('2020-03-31', 1)]) === 12);
+
   console.log('segments');
   const segBars = [bar('2019-01-01', 100), bar('2020-01-01', 150), bar('2023-01-01', 75)];
   t('era slice respects bounds', approx(segment(segBars, '1900-01-01', '2020-02-20').ret, 50));
@@ -528,12 +606,22 @@ async function main() {
   const from = flagValue('--from', null);
   const section = flagValue('--section', 'all');
   const csvDir = flagValue('--csv', null);
+  const loadFile = flagValue('--load', null);
+  const dumpFile = flagValue('--dump', null);
 
-  process.stdout.write(`Fetching full daily history for ${tickers.join(' ')}…\n`);
+  let loaded = null;
+  if (loadFile) {
+    loaded = loadBars(path.resolve(loadFile));
+    process.stdout.write(`Loaded ${loadFile} — ${[...loaded.keys()].join(' ')}\n`);
+  } else {
+    process.stdout.write(`Fetching full daily history for ${tickers.join(' ')}…\n`);
+  }
+  const symbols = loaded ? [...loaded.keys()].filter((s) => !want || tickers.includes(s)) : tickers;
+
   const data = [];
-  for (const sym of tickers) {
+  for (const sym of symbols) {
     try {
-      let bars = await fetchDaily(sym);
+      let bars = loaded ? loaded.get(sym) : await fetchDaily(sym);
       if (from) bars = bars.filter((b) => b.date >= from);
       if (bars.length < 60) throw new Error(`only ${bars.length} bars`);
       data.push({
@@ -549,8 +637,16 @@ async function main() {
     }
   }
   if (!data.length) {
-    console.error('No data fetched. Yahoo may be throttling; wait a minute and retry.');
+    console.error(loadFile
+      ? 'Nothing usable in that file.'
+      : 'No data. A 403 or timeout on every symbol usually means the network blocks Yahoo ' +
+        '(proxy or firewall) rather than throttling — run --dump where it is reachable, then ' +
+        '--load that file here.');
     process.exit(1);
+  }
+  if (periodsPerYear(data[0].bars) === 12) {
+    console.log(paint('\nMonth-end data: volatility is annualized from monthly returns, and ' +
+      'high/low/drawdown are month-end extremes rather than intraday.', C.dim));
   }
 
   const show = (name) => section === 'all' || section === name;
@@ -564,6 +660,7 @@ async function main() {
     console.log(paint('\nCSV', C.bold));
     writeCsvs(csvDir, data);
   }
+  if (dumpFile) dumpBars(path.resolve(dumpFile), data, hasFlag('--monthly'));
   console.log();
 }
 
