@@ -144,6 +144,35 @@ Every section runs identically off the file. Month-end input is detected from th
 bar spacing: volatility is then annualized from monthly returns, and high, low and
 drawdown are month-end extremes rather than intraday.
 
+## Option-chain rating
+
+`optrate.js` reads CBOE-format chain exports (a broker's "download quotedata"
+CSV) and rates every call for a **buyer** on all five greeks plus liquidity.
+
+```
+node optrate.js weat_quotedata_2.csv weat_quotedata_3.csv
+node optrate.js --all chain.csv
+node optrate.js --spot 27.20 chain.csv
+node optrate.js --check
+```
+
+Chain exports carry IV, Delta and Gamma but not Theta, Vega or Rho, so those
+three are computed with Black-Scholes from the chain's own implied vol, with the
+risk-free rate calibrated so the model reproduces the chain's published deltas.
+The fit error is printed; a high one means the quotes are stale or internally
+inconsistent and the computed greeks should not be trusted.
+
+| Light | Delta | Gamma (vs chain best) | Theta %/day | Vega %/vol pt | Rho %/1pp | Spread | OI |
+|---|---|---|---|---|---|---|---|
+| green | 0.45–0.75 | ≥70% | ≤0.20 | ≤3.5 | ≤2.5 | ≤6% | ≥500 |
+| yellow | 0.30–0.85 | ≥40% | ≤0.32 | ≤5.5 | ≤5.0 | ≤15% | ≥100 |
+
+Gamma is rated on convexity delivered, not per premium dollar — cost is scored
+separately under upside, and dividing by premium would penalise the same dollar
+twice. Adjusted series (an OCC root carrying a digit, e.g. `WEAT1`) are detected
+and excluded: they have a different deliverable and their greeks imply a
+different underlying.
+
 ## Data source & caveats
 
 Quotes come from Yahoo Finance's public chart endpoint (no API key). It is
