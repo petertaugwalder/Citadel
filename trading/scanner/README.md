@@ -80,6 +80,27 @@ are handled; the NY clock is the fallback.
   (anything in `/System/Library/Sounds/`), voice on/off via `sounds.voice`.
 - Keep the Mac awake through the session: `caffeinate -dis node commodity-scanner.js`.
 
+## History & seasonality backtest
+
+`backtest.js` pulls full daily history (Yahoo, `range=max`, distribution-adjusted)
+for all five and prints: all-time high/low with dates, CAGR, annualized vol, max
+drawdown, calendar-year returns, a year x month return grid, average return and
+hit rate per calendar month, era splits (pre-COVID / COVID / Ukraine / post-spike
+/ current) and a daily-return correlation matrix.
+
+```
+node backtest.js
+node backtest.js --section seasonality
+node backtest.js --ticker WEAT,CORN --from 2015-01-01
+node backtest.js --csv ./out
+node backtest.js --check
+```
+
+Sections: `summary`, `years`, `months`, `seasonality`, `eras`, `corr`. `--csv DIR`
+writes summary/monthly/yearly/seasonality CSVs for a spreadsheet. Seasonal
+averages over ~15 observations per month are suggestive, not predictive — read
+the hit rate next to the average before trusting either.
+
 ## Data source & caveats
 
 Quotes come from Yahoo Finance's public chart endpoint (no API key). It is
