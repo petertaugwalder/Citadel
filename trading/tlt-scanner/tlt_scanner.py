@@ -366,8 +366,14 @@ def regime_score(comps: list[dict]) -> tuple[float, str]:
     return round(score, 1), label
 
 
-def bounce_series(tlt: pd.DataFrame) -> pd.Series:
-    """Mean-reversion long trigger: oversold within 10 bars + RSI hook + price/momentum recovery."""
+def bounce_series(tlt: pd.DataFrame, ub: pd.DataFrame | None = None) -> pd.Series:
+    """Mean-reversion long trigger: oversold within 10 bars + RSI hook + price/momentum
+    recovery, and futures not still making new lows.
+
+    UB prices overnight while TLT is shut, so a cash hook printed on a day the
+    futures are still cutting a fresh 10-day low is the ETF lagging a move that has
+    not turned. When UB is unavailable the veto cannot be evaluated and is skipped
+    rather than assumed."""
     r = tlt["rsi14"]
     oversold_recent = (r < 32).rolling(10, min_periods=1).max() == 1
     hook = (r > r.shift(1)) & (r > 35)
@@ -375,11 +381,16 @@ def bounce_series(tlt: pd.DataFrame) -> pd.Series:
     mom_up = (tlt["macd_hist"] > tlt["macd_hist"].shift(1)) & (
         tlt["macd_hist"].shift(1) > tlt["macd_hist"].shift(2)
     )
-    return (oversold_recent & hook & (price_ok | mom_up)).fillna(False)
+    sig = oversold_recent & hook & (price_ok | mom_up)
+    if ub is not None and "Low" in ub.columns:
+        ub_low = ub["Low"].reindex(tlt.index).ffill()
+        fresh_low = ub_low <= ub_low.rolling(10, min_periods=3).min()
+        sig = sig & ~fresh_low.fillna(False)
+    return sig.fillna(False)
 
 
-def bounce_state(tlt: pd.DataFrame) -> dict:
-    sig = bounce_series(tlt)
+def bounce_state(tlt: pd.DataFrame, ub: pd.DataFrame | None = None) -> dict:
+    sig = bounce_series(tlt, ub)
     fresh = sig & ~sig.shift(1, fill_value=False)
     fresh_dates = list(sig.index[fresh])
     last_trigger = fresh_dates[-1] if fresh_dates else None
@@ -425,6 +436,150 @@ def trend_stack(frames: dict) -> list[dict]:
     add("UB close > 50-day", None if ub is None else _last(ub, "Close") > _last(ub, "sma50"))
     add("30y yield < its 50-day", None if tyx is None else _last(tyx, "Close") < _last(tyx, "sma50"))
     return items
+
+
+def breakdown_stack(frames: dict) -> list[dict]:
+    """The mirror of trend_stack: the 8 conditions that argue for puts.
+
+    Deliberately the exact inverse of the long checklist, so a tape cannot light
+    both stacks at once except through the neutral middle (a close sitting on a
+    moving average satisfies neither > nor <)."""
+    tlt, ub, tyx = frames.get("TLT"), frames.get("UB"), frames.get("TYX")
+    items: list[dict] = []
+
+    def add(name, val):
+        items.append({"name": name, "on": bool(val) if val is not None else None})
+
+    if tlt is not None:
+        add("TLT 9-EMA < 21-EMA", _last(tlt, "ema9") < _last(tlt, "ema21"))
+        add("TLT MACD < signal", _last(tlt, "macd") < _last(tlt, "macd_sig"))
+        add("TLT close < 50-day", _last(tlt, "Close") < _last(tlt, "sma50"))
+        s50 = tlt["sma50"].dropna()
+        add("TLT 50-day falling", len(s50) > 10 and float(s50.iloc[-1]) < float(s50.iloc[-11]))
+        highs = pivot_points(tlt["High"], w=4, kind="high")
+        add("TLT lower swing high", len(highs) >= 2 and float(highs.iloc[-1]) < float(highs.iloc[-2]))
+    else:
+        for name in ("TLT 9-EMA < 21-EMA", "TLT MACD < signal", "TLT close < 50-day",
+                     "TLT 50-day falling", "TLT lower swing high"):
+            add(name, None)
+    add("UB 9<21 EMA + MACD down",
+        None if ub is None else (_last(ub, "ema9") < _last(ub, "ema21")
+                                 and _last(ub, "macd") < _last(ub, "macd_sig")))
+    add("UB close < 50-day", None if ub is None else _last(ub, "Close") < _last(ub, "sma50"))
+    add("30y yield > its 50-day", None if tyx is None else _last(tyx, "Close") > _last(tyx, "sma50"))
+    return items
+
+
+def put_fade(frames: dict) -> dict:
+    """Melt-up fade: overbought TLT rejecting the 50-day while long yields trend up.
+
+    The short-side counterpart to the bounce, and just as much a rental — it is a
+    mean-reversion trigger, not a trend entry."""
+    tlt, tyx = frames.get("TLT"), frames.get("TYX")
+    if tlt is None or len(tlt) < 20:
+        return {"active": False, "reason": "no TLT data"}
+    r = tlt["rsi14"]
+    overbought_recent = bool((r.tail(10) > 70).any())
+    hook_down = bool(r.iloc[-1] < r.iloc[-2] and r.iloc[-1] < 65)
+    s50 = _last(tlt, "sma50")
+    rejected = bool(pd.notna(s50) and float(tlt["High"].iloc[-1]) >= s50
+                    and float(tlt["Close"].iloc[-1]) < s50)
+    yields_up = None if tyx is None else bool(_last(tyx, "Close") > _last(tyx, "sma50"))
+    active = overbought_recent and hook_down and (rejected or bool(yields_up))
+    return {"active": bool(active), "overbought_recent": overbought_recent,
+            "hook_down": hook_down, "rejected_50d": rejected, "yields_up": yields_up}
+
+
+def _rsi_hook(tlt: pd.DataFrame | None) -> int:
+    """+1 hooking up out of oversold, -1 hooking down out of overbought, else 0."""
+    if tlt is None or len(tlt) < 12:
+        return 0
+    r = tlt["rsi14"]
+    up = bool((r.tail(10) < 32).any()) and bool(r.iloc[-1] > r.iloc[-2] and r.iloc[-1] > 35)
+    down = bool((r.tail(10) > 70).any()) and bool(r.iloc[-1] < r.iloc[-2] and r.iloc[-1] < 65)
+    return 1 if up else (-1 if down else 0)
+
+
+def scorecard(frames: dict, aux: dict | None = None) -> dict:
+    """The daily -8..+8 tape score. Positive argues calls, negative argues puts.
+
+    Eight inputs, each +1 / -1 / 0. An input whose data is missing scores 0 and is
+    reported as n/a rather than silently counted as neutral agreement."""
+    tlt, ub, tyx = frames.get("TLT"), frames.get("UB"), frames.get("TYX")
+    rows: list[dict] = []
+
+    def add(name, val, note=""):
+        rows.append({"name": name, "score": val, "note": note})
+
+    # 30y yield: only a yield that is both below its average and falling is bullish
+    if tyx is None:
+        add("30y yield vs 50-day", None, "n/a")
+    else:
+        y, y50 = _last(tyx, "Close"), _last(tyx, "sma50")
+        s50 = tyx["sma50"].dropna()
+        falling = len(s50) > 10 and float(s50.iloc[-1]) < float(s50.iloc[-11])
+        rising = len(s50) > 10 and float(s50.iloc[-1]) > float(s50.iloc[-11])
+        add("30y yield vs 50-day", 1 if (y < y50 and falling) else (-1 if (y > y50 and rising) else 0),
+            f"{y:.2f} vs {y50:.2f}")
+    add("UB vs 50-day", None if ub is None else (1 if _last(ub, "Close") > _last(ub, "sma50") else -1),
+        "" if ub is None else to_32nds(_last(ub, "Close")))
+    for label, col in (("TLT vs 21-EMA", "ema21"), ("TLT vs 50-day", "sma50"), ("TLT vs 200-day", "sma200")):
+        if tlt is None:
+            add(label, None, "n/a")
+        else:
+            ref = _last(tlt, col)
+            add(label, 1 if _last(tlt, "Close") > ref else -1, f"{ref:.2f}")
+    hook = _rsi_hook(tlt)
+    add("RSI hook", hook if tlt is None or hook else 0,
+        "" if tlt is None else f"RSI {_last(tlt, 'rsi14'):.0f}")
+    # curve needs the 10y leg, which is not fetched; the row stays visible and n/a
+    curve = (aux or {}).get("curve")
+    add("10s30s not bear-steepening", None if curve is None else (-1 if curve.get("bear_steepener") else 1),
+        "n/a — 10y leg not fetched" if curve is None else curve.get("label", ""))
+    # UB leads TLT by hours: futures already moving is the tell
+    if ub is None or tlt is None:
+        add("UB leading TLT", None, "n/a")
+    else:
+        ub_chg, tlt_chg = _last(ub, "chg1"), _last(tlt, "chg1")
+        lead = 1 if (ub_chg > 0 and ub_chg > tlt_chg) else (-1 if (ub_chg < 0 and ub_chg < tlt_chg) else 0)
+        add("UB leading TLT", lead, f"UB {ub_chg:+.2f}% vs TLT {tlt_chg:+.2f}%")
+
+    scored = [r for r in rows if r["score"] is not None]
+    total = sum(r["score"] for r in scored)
+    return {"rows": rows, "score": total, "max": len(scored), "inputs_scored": len(scored),
+            "inputs_na": len(rows) - len(scored)}
+
+
+def direction_verdict(frames: dict, card: dict, long_tier: str, short_lit: int) -> dict:
+    """CALLS / PUTS / STAND ASIDE.
+
+    The score alone never fires. Cash, futures and the 30-year must agree: the same
+    strict AND gate the allocator uses, applied in both directions."""
+    ub, tyx = frames.get("UB"), frames.get("TYX")
+    score = card["score"]
+    yields_down = None if tyx is None else _last(tyx, "Close") < _last(tyx, "sma50")
+    yields_up = None if tyx is None else _last(tyx, "Close") > _last(tyx, "sma50")
+    ub_up = None if ub is None else _last(ub, "Close") > _last(ub, "sma50")
+    ub_down = None if ub is None else _last(ub, "Close") < _last(ub, "sma50")
+
+    gates_call = {"score >= +5": score >= 5, "30y yield < 50-day": bool(yields_down),
+                  "UB > 50-day": bool(ub_up)}
+    gates_put = {"score <= -5": score <= -5, "30y yield > 50-day": bool(yields_up),
+                 "UB < 50-day": bool(ub_down)}
+
+    if all(gates_call.values()):
+        side, gates = "CALLS", gates_call
+        size = {"FLIP": "full", "CONFIRMED": "standard", "SCOUT": "scout"}.get(long_tier, "scout")
+    elif all(gates_put.values()):
+        side, gates = "PUTS", gates_put
+        size = "full" if short_lit >= 6 else ("standard" if short_lit >= 5 else "scout")
+    else:
+        side = "STAND ASIDE"
+        gates = gates_call if score >= 0 else gates_put
+        size = "none"
+    missing = [k for k, v in gates.items() if not v]
+    return {"side": side, "size": size, "score": score, "max": card["max"],
+            "gates": gates, "missing": missing}
 
 
 def stack_tier(items: list[dict], tlt: pd.DataFrame | None) -> tuple[int, str]:
@@ -680,7 +835,7 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
     res: dict = {
         "as_of": str(frames["TLT"].index[-1].date()),
         "regime": {"score": score, "label": label, "components": comps},
-        "bounce": bounce_state(frames["TLT"]),
+        "bounce": bounce_state(frames["TLT"], frames.get("UB")),
         "stack": {},
         "divergences": divergences(frames),
         "aux": aux,
@@ -690,6 +845,17 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
     items = trend_stack(frames)
     lit, tier = stack_tier(items, frames.get("TLT"))
     res["stack"] = {"items": items, "lit": lit, "of": len(items), "tier": tier}
+
+    # short side: the mirror checklist, the melt-up fade, and the combined verdict
+    short_items = breakdown_stack(frames)
+    short_lit = sum(1 for i in short_items if i["on"])
+    res["breakdown"] = {"items": short_items, "lit": short_lit, "of": len(short_items),
+                        "tier": ("CONFIRMED" if short_lit >= 5 else
+                                 "SCOUT" if short_lit >= 3 else "NONE")}
+    res["put_fade"] = put_fade(frames)
+    card = scorecard(frames, aux)
+    res["scorecard"] = card
+    res["direction"] = direction_verdict(frames, card, tier, short_lit)
     for name in TICKERS:  # watchlist rows only — aux series never appear on the tape
         df = frames.get(name)
         if df is None:
@@ -705,6 +871,18 @@ def analyze(frames: dict, account: float | None = None, risk_pct: float = 1.0,
         }
     res["plan"] = action_and_levels(frames, res, account, risk_pct)
     res["exit"] = exit_engine(frames, res, entry, aux)
+    # The two verdicts answer different questions and can legitimately disagree:
+    # ACTION is the existing long-only trade plan (fires off the stack tier), while
+    # DIRECTION is the strict options gate (score plus three-way agreement). Say so
+    # explicitly rather than printing two headlines and leaving the reader to guess.
+    plan_is_buy = res["plan"]["action"].startswith("BUY")
+    if res["direction"]["side"] == "STAND ASIDE" and plan_is_buy:
+        res["direction"]["vs_plan"] = ("ACTION shows a BUY but the options gate is not met — "
+                                       "the shares plan is looser than the options gate; "
+                                       "size down or wait")
+    elif res["direction"]["side"] == "PUTS" and plan_is_buy:
+        res["direction"]["vs_plan"] = ("CONFLICT: long plan and put gate both lit — "
+                                       "treat as STAND ASIDE until one resolves")
     return res
 
 
@@ -760,7 +938,7 @@ def daily_state(frames: dict) -> pd.DataFrame:
             score = score + np.where(bullish.fillna(False), wgt, -wgt)
     st["regime"] = score / 15 * 100
 
-    trig = bounce_series(tlt)
+    trig = bounce_series(tlt, frames.get("UB"))
     st["bounce_sig"] = trig
     st["bounce_fresh"] = trig & ~trig.shift(1, fill_value=False)
     st["prior_low"] = tlt["Low"].rolling(15).min().shift(1)
@@ -1217,6 +1395,29 @@ def render_plain(res: dict, demo: bool) -> None:
     print(f"\n{BOLD}TREND-TURN STACK{END}  {st['lit']}/{st['of']} lit → tier: {st['tier']}")
     for i in st["items"]:
         print(f"  [{paint(i['on'], 'x', ' ', '?')}] {i['name']}")
+    bd = res["breakdown"]
+    print(f"\n{BOLD}BREAKDOWN STACK{END}  {bd['lit']}/{bd['of']} lit → tier: {bd['tier']}  {DIM}(puts){END}")
+    for i in bd["items"]:
+        print(f"  [{paint(i['on'], 'x', ' ', '?')}] {i['name']}")
+
+    d, card = res["direction"], res["scorecard"]
+    col = GREEN if d["side"] == "CALLS" else RED if d["side"] == "PUTS" else DIM
+    na = f"  {DIM}({card['inputs_na']} input n/a){END}" if card["inputs_na"] else ""
+    print(f"\n{BOLD}DIRECTION{END}  {col}{BOLD}{d['side']}{END}"
+          f"   score {card['score']:+d} / ±{card['max']}   size: {d['size']}{na}")
+    for r in card["rows"]:
+        mark = "  · " if r["score"] is None else (f"  {GREEN}+1{END} " if r["score"] > 0
+                                                  else f"  {RED}-1{END} " if r["score"] < 0 else f"  {DIM} 0{END} ")
+        note = f"  {DIM}{r['note']}{END}" if r["note"] else ""
+        print(f"{mark}{r['name']}{note}")
+    if d["missing"]:
+        print(f"  {DIM}blocked by: {', '.join(d['missing'])}{END}")
+    if d.get("vs_plan"):
+        print(f"  {YEL}! {d['vs_plan']}{END}")
+    pf = res["put_fade"]
+    if pf.get("active"):
+        print(f"  {RED}PUT FADE active{END} — overbought and rejecting the 50-day (rental, not a trend entry)")
+
     b = res["bounce"]
     b_txt = "TRIGGERED TODAY" if b["triggered_today"] else ("active — managing" if b["active"] else "idle")
     b_col = GREEN if b["active"] else DIM
@@ -1352,6 +1553,36 @@ def render_rich(res: dict, demo: bool) -> None:
             title="signal engine", border_style="magenta",
         )
     )
+    d, card = res["direction"], res["scorecard"]
+    dir_style = ("bold green" if d["side"] == "CALLS"
+                 else "bold red" if d["side"] == "PUTS" else "bold yellow")
+    bd = res["breakdown"]
+    dir_t = Text()
+    dir_t.append(f"{d['side']}", style=dir_style)
+    dir_t.append(f"   score {card['score']:+d} / ±{card['max']}   size: {d['size']}\n")
+    for r in card["rows"]:
+        if r["score"] is None:
+            dir_t.append("  ·  ", style="dim")
+        elif r["score"] > 0:
+            dir_t.append("  +1 ", style="green")
+        elif r["score"] < 0:
+            dir_t.append("  -1 ", style="red")
+        else:
+            dir_t.append("   0 ", style="dim")
+        dir_t.append(f"{r['name']}")
+        if r["note"]:
+            dir_t.append(f"  {r['note']}", style="dim")
+        dir_t.append("\n")
+    if d["missing"]:
+        dir_t.append(f"  blocked by: {', '.join(d['missing'])}\n", style="dim")
+    if d.get("vs_plan"):
+        dir_t.append(f"  ! {d['vs_plan']}\n", style="yellow")
+    dir_t.append(f"  breakdown stack (puts): {bd['lit']}/{bd['of']} — tier {bd['tier']}",
+                 style="dim" if bd["tier"] == "NONE" else "bold")
+    if res["put_fade"].get("active"):
+        dir_t.append("\n  PUT FADE active — overbought, rejecting the 50-day (rental)", style="red")
+    console.print(Panel(dir_t, title="direction — calls / puts / stand aside", border_style=
+                        "green" if d["side"] == "CALLS" else "red" if d["side"] == "PUTS" else "yellow"))
     if notes.plain:
         console.print(Panel(notes, title="cross-checks", border_style="cyan"))
     console.print(Panel(Group(plan, Text(), flips), title="plan", border_style="green"))
@@ -1407,6 +1638,19 @@ Why three instruments (one market, three quotes):
   TLT               - what you can actually buy; where entries/stops live.
   A missing UB feed degrades the scan exactly like a missing ^TYX: the
   affected conditions read n/a and no substitute is invented.
+
+DIRECTION (calls / puts / stand aside)
+  A -8..+8 scorecard over eight inputs: 30y yield vs its 50-day (and slope), UB
+  vs its 50-day, TLT vs 21-EMA / 50-day / 200-day, an RSI hook out of oversold or
+  overbought, 10s30s not bear-steepening (n/a - the 10y leg is not fetched), and
+  whether UB is leading TLT on the day. Missing data scores 0 and prints n/a; the
+  denominator shrinks rather than counting silence as agreement.
+  The score never fires alone:
+    CALLS  if score >= +5 AND 30y yield < 50-day AND UB > 50-day
+    PUTS   if score <= -5 AND 30y yield > 50-day AND UB < 50-day
+    else   STAND ASIDE
+  DIRECTION is the strict options gate; ACTION below is the long-only shares plan
+  and is looser. They can disagree, and the panel says so when they do.
 
 Layer 1 - REGIME (should you even be hunting longs?)
   Moving-average structure (price vs 50d/200d, 50d slope, 50d vs 200d) scored

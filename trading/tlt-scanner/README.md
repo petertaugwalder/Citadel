@@ -73,6 +73,27 @@ period**: bear regime = rent bounces; transition = scout; bull = hold and add.
   condition is a brick, and confirmation deliberately costs a worse price in
   exchange for better odds.
 
+**Layer 2b — BREAKDOWN STACK + DIRECTION** (the short side): the exact mirror of
+the trend-turn checklist (TLT/UB losing 9/21 and the 50-day, 30y yield reclaiming
+its 50-day, lower swing high), plus a **PUT FADE** rental — overbought TLT
+rejecting the 50-day while long yields trend up. These feed a **-8…+8 scorecard**
+and one verdict: **CALLS / PUTS / STAND ASIDE**.
+
+The score never fires alone. Cash, futures and the 30-year must agree — the same
+strict AND gate the allocator uses, applied in both directions:
+
+```
+CALLS  if score >= +5 AND 30y yield < 50-day AND UB > 50-day
+PUTS   if score <= -5 AND 30y yield > 50-day AND UB < 50-day
+else   STAND ASIDE
+```
+
+An input whose data is missing scores 0 and prints `n/a`; the denominator shrinks
+rather than the row being counted as agreement. The 10s30s row reads `n/a` because
+the 10y leg is not fetched. **DIRECTION and ACTION can disagree** — ACTION is the
+long-only shares plan and fires off the stack tier, DIRECTION is the stricter
+options gate. When they differ the panel says so instead of printing two headlines.
+
 **Layer 3 — CROSS-CHECKS**: TLT bullish RSI divergence, ^TYX yield-exhaustion
 divergence, and UB/TLT momentum disagreement (UB leads by hours).
 The aux inputs add display lines here: dated live duration (`D≈…` with the
