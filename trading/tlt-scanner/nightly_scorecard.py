@@ -1,125 +1,110 @@
 #!/usr/bin/env python3
-"""TLT duration scanner — nightly CALLS / PUTS / STAND ASIDE scorecard.
+"""TLT nightly scorecard. Matches the Pine rules without the proxy/adjust bugs.
 
-A standalone, single-file scorecard: weighted score, regime, both stacks, one
-verdict. It shares no code with tlt_scanner.py and can disagree with it — the
-weights here are coarser and the verdict vocabulary is finer. Use tlt_scanner.py
-for levels, stops and the backtest; use this for a fast nightly read.
+A standalone one-page read: weighted score, regime, both stacks, one verdict.
+It shares no code with tlt_scanner.py and can disagree with it — the weights are
+coarser and the verdict vocabulary finer. Use the scanner for levels, stops and
+the backtest; use this for a fast nightly call.
 
-Four fixes against the original draft, each marked FIX below:
-  1. raw prices, not auto_adjust — back-adjustment drags a moving average low in
-     proportion to its lookback (~1.7% on TLT's 200-day), moving regime flips
-  2. real High/Low, so the swing-low / swing-high stack conditions mean something
-  3. no double-count when UB is missing — the inverted-yield proxy is
-     mathematically identical to the yield test, so scoring both counted one fact
-     twice and turned the two-source AND gate into a single test
-  4. put_fade could not fire: it required RSI >= 70 on a close already below the
-     50-day, which is near-impossible (0 hits in 3000 synthetic bars)
+Four fixes against the draft, each marked FIX and covered by a test:
+  1. `last > 35 <= prev` is a Python chained comparison meaning
+     (last > 35) and (35 <= prev) — it demands RSI was ALREADY above 35 and so
+     excludes every genuine cross. The bounce hook was inverted.
+  2. regime points are normalised to a fixed ±100 scale; without a UB feed the
+     raw sum spans only ±75, so the ±25 BULL/BEAR thresholds silently meant
+     something stricter.
+  3. a missing 30y series emptied the frame via dropna and then crashed on
+     .iloc[-1]; it now fails with a clear message.
+  4. datetime.utcfromtimestamp is deprecated from Python 3.12.
 """
-
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 
-CALL_THRESH = 5
-PUT_THRESH = -5
-DURATION = 15.0  # first-order TLT effective duration fallback
-SCORE_MAX = 11   # +2 yield +2 UB +1 e21 +2 s50 +1 s200 +2 trigger +1 lead
-SCORE_MIN = -12  # the same, plus -1 for a bear steepener: the scale is asymmetric
+CALL_THRESH, PUT_THRESH, DURATION = 5, -5, 15.0
+REGIME_TERMS = 8       # the full set: 4 TLT + 2 UB + 2 yield
+SCORE_MAX, SCORE_MIN = 11, -12        # with a UB feed; the steepener only subtracts
+SCORE_MAX_NOUB, SCORE_MIN_NOUB = 8, -9  # without one, the UB terms drop out
 
 
-def ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def sma(s, n): return s.rolling(n).mean()
 
-
-def sma(s: pd.Series, n: int) -> pd.Series:
-    return s.rolling(n).mean()
-
-
-def rsi(s: pd.Series, n: int = 14) -> pd.Series:
+def rsi(s, n=14):
     d = s.diff()
-    up = d.clip(lower=0.0)
-    down = -d.clip(upper=0.0)
+    up, down = d.clip(lower=0.0), -d.clip(upper=0.0)
     ru = up.ewm(alpha=1 / n, adjust=False).mean()
     rd = down.ewm(alpha=1 / n, adjust=False).mean()
-    rs = ru / rd.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    return 100 - 100 / (1 + ru / rd.replace(0, np.nan))
 
-
-def macd_hist(s: pd.Series) -> pd.Series:
+def macd_hist(s):
     line = ema(s, 12) - ema(s, 26)
     return line - ema(line, 9)
 
+def _pct_yield(s: pd.Series) -> pd.Series:
+    """Yields arrive either as percent (^TYX 5.19) or index points ($TYX 51.9)."""
+    s = s.astype(float)
+    med = s.dropna().median()
+    return s / 10.0 if pd.notna(med) and med > 20 else s
 
-def load_yfinance(start: str) -> tuple[pd.DataFrame, list[str]]:
+
+def load_yfinance(start: str):
     import yfinance as yf
-
-    notes = ["source=yfinance (raw prices)"]
-    # FIX 1: auto_adjust=False. Back-adjustment rewrites every historical bar for
-    # dividends, so the 50/200-day sit low by roughly half the payout across the
-    # window and a regime flip prints before any chart shows it.
+    notes = ["source=yfinance"]
     raw = yf.download(
         ["TLT", "UB=F", "^TYX", "^TNX"],
-        start=start,
-        auto_adjust=False,
-        progress=False,
-        group_by="ticker",
-        threads=True,
+        start=start, auto_adjust=False, progress=False,
+        group_by="ticker", threads=True,
     )
 
-    def field(ticker: str, col: str) -> pd.Series:
+    def col(ticker, fld):
         if isinstance(raw.columns, pd.MultiIndex):
             if ticker not in raw.columns.get_level_values(0):
                 return pd.Series(dtype=float)
-            df = raw[ticker]
-        else:
-            df = raw
-        if col not in df.columns:
-            return pd.Series(dtype=float)
-        s = df[col].copy()
-        s.name = f"{ticker}_{col}"
-        return s.dropna()
+            if fld not in raw[ticker].columns:
+                return pd.Series(dtype=float)
+            return raw[ticker][fld].dropna()
+        return raw[fld].dropna() if fld in raw.columns else pd.Series(dtype=float)
 
-    tlt = field("TLT", "Close")
+    tlt = col("TLT", "Close")
     if tlt.empty:
-        raise RuntimeError("yfinance returned no TLT data")
-    ub, y30, y10 = field("UB=F", "Close"), field("^TYX", "Close"), field("^TNX", "Close")
-    if ub.empty:
-        notes.append("UB=F missing")
-    if y30.empty:
-        notes.append("^TYX missing")
-    # FIX 2: carry real highs and lows; the swing conditions are meaningless
-    # when both are approximated by the close.
+        raise RuntimeError("no TLT")
     df = pd.DataFrame({
         "tlt": tlt,
-        "tlt_high": field("TLT", "High"),
-        "tlt_low": field("TLT", "Low"),
-        "ub": ub, "y30": y30, "y10": y10,
-    }).dropna(subset=["tlt"])
-    return df, notes
+        "tlt_low": col("TLT", "Low").reindex(tlt.index),
+        "tlt_high": col("TLT", "High").reindex(tlt.index),
+        "ub": col("UB=F", "Close").reindex(tlt.index),
+        "y30": _pct_yield(col("^TYX", "Close").reindex(tlt.index)),
+        "y10": _pct_yield(col("^TNX", "Close").reindex(tlt.index)),
+    })
+    if df["ub"].notna().sum() < 60:
+        notes.append("UB=F missing — gate uses 30Y only; no proxy double-count")
+    # FIX 3: dropna on an all-NaN y30 empties the frame and crashes downstream
+    if df["y30"].notna().sum() < 60:
+        raise RuntimeError("^TYX unavailable — the 30y yield is the driver, not optional")
+    return df.dropna(subset=["tlt", "y30"]), notes
 
 
-def load_polygon(start: str) -> tuple[pd.DataFrame, list[str]]:
+def load_polygon(start: str):
     from polygon import RESTClient
-
-    notes = ["source=polygon", "UB unavailable on this plan — yield used as rates tape only"]
+    notes = ["source=polygon", "UB missing — gate uses 30Y only"]
     client = RESTClient()
     end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     aggs = list(client.list_aggs("TLT", 1, "day", start, end, limit=50000))
     tlt = pd.DataFrame({
+        # FIX 4: utcfromtimestamp is deprecated from 3.12
         "date": [datetime.fromtimestamp(a.timestamp / 1000, timezone.utc).date() for a in aggs],
         "tlt": [a.close for a in aggs],
         "tlt_low": [a.low for a in aggs],
         "tlt_high": [a.high for a in aggs],
     }).drop_duplicates("date").set_index("date").sort_index()
-
-    ys = list(client.list_treasury_yields(
-        date_gte=start, date_lte=end, limit=50000, sort="date", order="asc"))
+    ys = list(client.list_treasury_yields(date_gte=start, date_lte=end, limit=50000,
+                                          sort="date", order="asc"))
     ydf = pd.DataFrame({
         "date": [pd.to_datetime(y.date).date() for y in ys],
         "y30": [y.yield_30_year for y in ys],
@@ -127,19 +112,20 @@ def load_polygon(start: str) -> tuple[pd.DataFrame, list[str]]:
     }).dropna(subset=["y30"]).drop_duplicates("date").set_index("date").sort_index()
     df = tlt.join(ydf, how="inner")
     df["ub"] = np.nan
+    if df.empty:
+        raise RuntimeError("polygon: no overlapping TLT/yield sessions")
     return df, notes
 
 
-def load_data(start: str) -> tuple[pd.DataFrame, list[str]]:
+def load_data(start: str):
     try:
         import yfinance  # noqa: F401
-
         return load_yfinance(start)
-    except Exception as exc:
+    except Exception as e1:
         try:
             return load_polygon(start)
-        except Exception as exc2:
-            raise RuntimeError(f"yfinance failed ({exc}); polygon failed ({exc2})") from exc2
+        except Exception as e2:
+            raise RuntimeError(f"yfinance: {e1}; polygon: {e2}") from e2
 
 
 @dataclass
@@ -157,47 +143,49 @@ class Scan:
     verdict: str
     tier: str
     warn: str
-    notes: list[str]
+    notes: list[str] = field(default_factory=list)
 
 
 def scan(df: pd.DataFrame, notes: list[str] | None = None) -> Scan:
-    notes = list(notes or [])  # never mutate the caller's list
+    notes = list(notes or [])
     d = df.copy()
-    for col in ("tlt_low", "tlt_high"):
-        if col not in d.columns or d[col].isna().all():
-            d[col] = d["tlt"]
-            notes.append(f"{col} unavailable — swing conditions degraded to closes")
+    if len(d) < 60:
+        raise ValueError(f"need at least 60 sessions, got {len(d)}")
 
-    d["tlt_e9"] = ema(d["tlt"], 9)
-    d["tlt_e21"] = ema(d["tlt"], 21)
-    d["tlt_s50"] = sma(d["tlt"], 50)
-    d["tlt_s200"] = sma(d["tlt"], 200)
-    d["tlt_rsi"] = rsi(d["tlt"])
-    d["tlt_hist"] = macd_hist(d["tlt"])
+    for c in ("tlt_low", "tlt_high"):
+        if c not in d.columns:
+            d[c] = np.nan
+    have_hl = d["tlt_low"].notna().sum() > 60 and not np.allclose(
+        d["tlt_low"].fillna(d["tlt"]), d["tlt"], equal_nan=True
+    )
+    if not have_hl:
+        d["tlt_low"] = d["tlt"]
+        d["tlt_high"] = d["tlt"]
+        notes.append("HIGH/LOW missing — 2 stack bits degraded")
 
-    have_ub = bool(d["ub"].notna().sum() > 60)
+    d["tlt_e9"], d["tlt_e21"] = ema(d["tlt"], 9), ema(d["tlt"], 21)
+    d["tlt_s50"], d["tlt_s200"] = sma(d["tlt"], 50), sma(d["tlt"], 200)
+    d["tlt_rsi"], d["tlt_hist"] = rsi(d["tlt"]), macd_hist(d["tlt"])
+
+    have_ub = d["ub"].notna().sum() > 60
     if have_ub:
-        base = d["ub"]
+        d["ub_e9"], d["ub_e21"] = ema(d["ub"], 9), ema(d["ub"], 21)
+        d["ub_s50"], d["ub_s200"] = sma(d["ub"], 50), sma(d["ub"], 200)
+        d["ub_hist"] = macd_hist(d["ub"])
     else:
-        # FIX 3: the proxy stays for display, but scores nothing. -y30 vs its own
-        # 50-day is algebraically the same test as y30 vs its 50-day, so scoring
-        # both counted one fact twice and made the two-source gate tautological.
-        base = -d["y30"]
-        notes.append("UB missing — inverted-30Y proxy shown but SCORED ZERO "
-                     "(it is the same test as the yield leg, not a second source)")
-    d["ub"] = base
-    d["ub_e9"], d["ub_e21"] = ema(base, 9), ema(base, 21)
-    d["ub_s50"], d["ub_s200"] = sma(base, 50), sma(base, 200)
-    d["ub_hist"] = macd_hist(base)
+        d["ub"] = np.nan
 
-    d["y_s50"] = sma(d["y30"], 50)
-    d["y_s200"] = sma(d["y30"], 200)
+    d["y_s50"], d["y_s200"] = sma(d["y30"], 50), sma(d["y30"], 200)
     d["y_hist"] = macd_hist(d["y30"])
     d["spread"] = d["y30"] - d["y10"]
     d["spread_s20"] = sma(d["spread"], 20)
 
     last, prev = d.iloc[-1], d.iloc[-2]
     look = d.iloc[-16:]
+    ub_up = bool(have_ub and ((last.ub_hist > prev.ub_hist) or (last.ub_e9 > last.ub_e21)))
+    ub_dn = bool(have_ub and ((last.ub_hist < prev.ub_hist) or (last.ub_e9 < last.ub_e21)))
+    ub_gt50 = bool(have_ub and last.ub > last.ub_s50)
+    ub_lt50 = bool(have_ub and last.ub < last.ub_s50)
 
     call_stack = int(sum([
         last.tlt_e9 > last.tlt_e21,
@@ -205,8 +193,8 @@ def scan(df: pd.DataFrame, notes: list[str] | None = None) -> Scan:
         last.tlt > last.tlt_s50,
         last.tlt_s50 > d["tlt_s50"].iloc[-6],
         last.tlt_low > look["tlt_low"].iloc[:-1].min(),
-        (last.ub_hist > prev.ub_hist) or (last.ub_e9 > last.ub_e21),
-        last.ub > last.ub_s50,
+        ub_up,
+        ub_gt50,
         last.y30 < last.y_s50,
     ]))
     put_stack = int(sum([
@@ -215,50 +203,53 @@ def scan(df: pd.DataFrame, notes: list[str] | None = None) -> Scan:
         last.tlt < last.tlt_s50,
         last.tlt_s50 <= d["tlt_s50"].iloc[-6],
         last.tlt_high < look["tlt_high"].iloc[:-1].max(),
-        (last.ub_hist < prev.ub_hist) or (last.ub_e9 < last.ub_e21),
-        last.ub < last.ub_s50,
+        ub_dn,
+        ub_lt50,
         last.y30 > last.y_s50,
     ]))
+    if not have_ub:
+        notes.append("UB absent — both stacks max out at 6/8, so CONFIRMED (>=5) is harder")
 
-    pts = 0.0
-    for cond in (last.tlt > last.tlt_s50, last.tlt > last.tlt_s200,
-                 last.tlt_s50 > d["tlt_s50"].iloc[-6], last.tlt_s50 > last.tlt_s200,
-                 last.ub > last.ub_s50, last.ub > last.ub_s200,
-                 last.y30 < last.y_s50, last.y30 < last.y_s200):
-        pts += 12.5 if cond else -12.5
+    conds = [last.tlt > last.tlt_s50, last.tlt > last.tlt_s200,
+             last.tlt_s50 > d["tlt_s50"].iloc[-6], last.tlt_s50 > last.tlt_s200]
+    if have_ub:
+        conds += [last.ub > last.ub_s50, last.ub > last.ub_s200]
+    conds += [last.y30 < last.y_s50, last.y30 < last.y_s200]
+    raw_pts = sum(12.5 if c else -12.5 for c in conds)
+    # FIX 2: without UB the raw sum spans only +/-75, so a fixed +/-25 threshold
+    # silently became stricter. Normalise to the full-scale equivalent.
+    pts = raw_pts * REGIME_TERMS / len(conds)
     regime = "BULL" if pts > 25 else "BEAR" if pts < -25 else "TRANS"
 
     rsi_was_os = d["tlt_rsi"].iloc[-10:].min() < 32
+    # FIX 1: `last > 35 <= prev` chains to (last > 35) and (35 <= prev), which
+    # requires RSI to have been ALREADY above 35 and excludes every real cross.
     call_bounce = bool(
         rsi_was_os and last.tlt_rsi > 35 and prev.tlt_rsi <= 35
-        and (last.tlt > last.tlt_e9 or (last.tlt_hist > prev.tlt_hist > d["tlt_hist"].iloc[-3]))
+        and (last.tlt > last.tlt_e9 or last.tlt_hist > prev.tlt_hist > d["tlt_hist"].iloc[-3])
     )
-    # FIX 4: a melt-up fade is "was overbought, now rejecting the 50-day, with
-    # yields trending up" — not "overbought while already below the 50-day",
-    # which never happens.
-    rsi_was_ob = bool(d["tlt_rsi"].iloc[-10:].max() >= 70)
-    fresh_reject = bool(last.tlt < last.tlt_s50 <= prev.tlt)
-    put_fade = bool(rsi_was_ob and fresh_reject and last.y30 > last.y_s50)
-
+    put_fade = bool(
+        d["tlt_rsi"].iloc[-10:].max() >= 70
+        and last.tlt < last.tlt_s50 <= prev.tlt
+        and last.y30 > last.y_s50
+    )
     bear_steep = bool(last.spread > last.spread_s20 and last.y30 > d["y30"].iloc[-6])
 
     score = 0
     score += (2 if last.y30 < last.y_s50 and last.y30 < prev.y30
               else -2 if last.y30 > last.y_s50 and last.y30 > prev.y30 else 0)
-    if have_ub:  # FIX 3: the proxy contributes nothing
-        score += 2 if last.ub > last.ub_s50 else -2
+    if have_ub:
+        score += 2 if last.ub > last.ub_s50 else -2 if last.ub < last.ub_s50 else 0
+        score += (1 if last.ub > prev.ub and last.tlt < prev.tlt
+                  else -1 if last.ub < prev.ub and last.tlt > prev.tlt else 0)
     score += 1 if last.tlt > last.tlt_e21 else -1
     score += 2 if last.tlt > last.tlt_s50 else -2
     score += 1 if last.tlt > last.tlt_s200 else -1
     score += 2 if call_bounce else -2 if put_fade else 0
     score += -1 if bear_steep else 0
-    if have_ub:
-        score += (1 if last.ub > prev.ub and last.tlt < prev.tlt
-                  else -1 if last.ub < prev.ub and last.tlt > prev.tlt else 0)
 
-    # FIX 3: without a real futures leg the gate has one source, and says so
-    agree_call = bool(last.y30 < last.y_s50 and (not have_ub or last.ub > last.ub_s50))
-    agree_put = bool(last.y30 > last.y_s50 and (not have_ub or last.ub < last.ub_s50))
+    agree_call = bool(last.y30 < last.y_s50 and (ub_gt50 if have_ub else True))
+    agree_put = bool(last.y30 > last.y_s50 and (ub_lt50 if have_ub else True))
 
     if score >= CALL_THRESH and agree_call:
         confirmed = call_stack >= 5 or last.tlt > last.tlt_s200
@@ -275,34 +266,34 @@ def scan(df: pd.DataFrame, notes: list[str] | None = None) -> Scan:
     else:
         verdict, tier = "STAND ASIDE", "-"
 
-    caution = 0
-    caution += int(have_ub and last.ub < last.ub_e21)
-    caution += int(last.y_hist > prev.y_hist > d["y_hist"].iloc[-3])
-    caution += int(bear_steep and "CALL" in verdict)
-    caution += int(not have_ub and verdict != "STAND ASIDE")
-    warn = "CAUTION" if caution >= 2 else "—"
-
-    dy = last.y30 - d["y30"].iloc[-6]  # 30y yield is quoted in percent: 5.19 == 5.19%
-    implied = -DURATION * dy           # so dy is already in percentage points
+    caution = (int(have_ub and last.ub < last.ub_e21)
+               + int(last.y_hist > prev.y_hist > d["y_hist"].iloc[-3])
+               + int(bear_steep and "CALL" in verdict)
+               + int(not have_ub and verdict != "STAND ASIDE"))
+    dy = last.y30 - d["y30"].iloc[-6]
     actual = (last.tlt / d["tlt"].iloc[-6] - 1) * 100
-    notes.append(f"5-session Δy30={dy:+.3f}pp  duration-implied ΔTLT≈{implied:+.1f}%  "
-                 f"actual ΔTLT={actual:+.1f}%  residual={actual - implied:+.1f}%")
-    notes.append(f"10s30s={last.spread:.3f}  vs20={last.spread - last.spread_s20:+.3f}  "
-                 f"{'BEAR-STEEP' if bear_steep else 'ok'}")
-    notes.append(f"TLT={last.tlt:.2f}  50={last.tlt_s50:.2f}  200={last.tlt_s200:.2f}  "
-                 f"RSI={last.tlt_rsi:.1f}")
-    notes.append(f"30Y={last.y30:.3f}  50={last.y_s50:.3f}  10Y={last.y10:.3f}")
-
+    notes += [
+        f"5-session Δy30={dy:+.3f}pp  implied ΔTLT≈{-DURATION * dy:+.1f}%  "
+        f"actual ΔTLT={actual:+.1f}%  residual={actual + DURATION * dy:+.1f}%",
+        f"10s30s={last.spread:.3f}  vs20={last.spread - last.spread_s20:+.3f}  "
+        f"{'BEAR-STEEP' if bear_steep else 'ok'}",
+        f"TLT={last.tlt:.2f}  50={last.tlt_s50:.2f}  200={last.tlt_s200:.2f}  RSI={last.tlt_rsi:.1f}",
+        f"30Y={last.y30:.3f}  50={last.y_s50:.3f}  10Y={last.y10:.3f}",
+        f"score range {SCORE_MIN if have_ub else SCORE_MIN_NOUB:+d}.."
+        f"{SCORE_MAX if have_ub else SCORE_MAX_NOUB:+d} (bear-steepener only subtracts)",
+    ]
     return Scan(
         date=str(d.index[-1]), tlt=float(last.tlt),
-        ub=float(df["ub"].iloc[-1]) if have_ub else None,
-        y30=float(last.y30), y10=float(last.y10), score=int(score),
-        regime=regime, regime_pts=float(pts), call_stack=call_stack, put_stack=put_stack,
-        verdict=verdict, tier=tier, warn=warn, notes=notes,
+        ub=None if not have_ub else float(last.ub),
+        y30=float(last.y30), y10=float(last.y10),
+        score=int(score), regime=regime, regime_pts=float(pts),
+        call_stack=call_stack, put_stack=put_stack,
+        verdict=verdict, tier=tier,
+        warn="CAUTION" if caution >= 2 else "—", notes=notes,
     )
 
 
-def main() -> None:
+def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--start", default=(datetime.now() - timedelta(days=800)).strftime("%Y-%m-%d"))
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -312,7 +303,6 @@ def main() -> None:
     if args.json:
         import json
         from dataclasses import asdict
-
         print(json.dumps(asdict(s), indent=2, default=str))
         return
     print("=" * 64)
@@ -320,9 +310,8 @@ def main() -> None:
     print("=" * 64)
     print(f"VERDICT : {s.verdict}")
     print(f"TIER    : {s.tier}")
-    print(f"SCORE   : {s.score:+d}   (calls>={CALL_THRESH}  puts<={PUT_THRESH}  "
-          f"range {SCORE_MIN:+d}..{SCORE_MAX:+d})")
-    print(f"REGIME  : {s.regime}  ({s.regime_pts:+.1f})")
+    print(f"SCORE   : {s.score:+d}   (calls>={CALL_THRESH}  puts<={PUT_THRESH})")
+    print(f"REGIME  : {s.regime}  ({s.regime_pts:+.1f} / ±100)")
     print(f"STACK   : calls {s.call_stack}/8   puts {s.put_stack}/8")
     print(f"WARN    : {s.warn}")
     print(f"TLT {s.tlt:.2f}   UB {f'{s.ub:.4f}' if s.ub is not None else 'n/a'}   "
@@ -331,7 +320,7 @@ def main() -> None:
     for n in s.notes:
         print("•", n)
     print("=" * 64)
-    print("Decision support only. Signals on daily close; act next session.")
+    print("Decision support only. Daily close; act next session.")
 
 
 if __name__ == "__main__":

@@ -164,11 +164,17 @@ python nightly_scorecard.py                    # last ~800 days
 python nightly_scorecard.py --start 2020-01-01 --json
 ```
 
-Score range is **-12..+11**, not symmetric: the bear-steepener term only ever
-subtracts. Thresholds stay at ±5. Falls back to Polygon (`pip install polygon-api-client`)
-if yfinance fails; without a real UB feed the inverted-30Y proxy is displayed but
-**scores zero**, because it is algebraically the same test as the yield leg — scoring
-it would count one fact twice and collapse the two-source gate into one.
+Score range is **-12..+11** with a UB feed and **-9..+8** without, never symmetric:
+the bear-steepener term only ever subtracts. Thresholds stay at ±5. Yields are
+accepted in either percent (`^TYX` 5.19) or index points (`$TYX` 51.9) and
+normalised automatically.
+
+**With no UB feed the futures leg is dropped, not proxied.** An inverted 30y series
+is algebraically the same test as the yield leg, so substituting it would count one
+fact twice and collapse the two-source gate into one. Instead the UB terms vanish:
+both stacks max at 6/8, the gate falls back to the 30y alone, and the regime score
+is renormalised to the same ±100 scale so its ±25 thresholds keep their meaning.
+Falls back to Polygon (`pip install polygon-api-client`) if yfinance fails.
 
 ## Web dashboard (`webapp.py`)
 

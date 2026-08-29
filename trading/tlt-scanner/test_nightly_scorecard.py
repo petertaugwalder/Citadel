@@ -52,9 +52,10 @@ class ScoringTests(unittest.TestCase):
         # leave the score unchanged by silently substituting the yield
         self.assertNotEqual(with_ub.score, None)
         self.assertTrue(without.ub is None)
-        self.assertTrue(any("SCORED ZERO" in n for n in without.notes))
-        # and the surviving score must be reachable without the UB terms
-        self.assertLessEqual(abs(without.score), ns.SCORE_MAX - 2)
+        self.assertTrue(any("max out at 6/8" in n for n in without.notes))
+        # the surviving score must fit the reduced, UB-free bounds
+        self.assertLessEqual(without.score, ns.SCORE_MAX_NOUB)
+        self.assertGreaterEqual(without.score, ns.SCORE_MIN_NOUB)
 
     def test_put_fade_can_actually_fire(self):
         """The original condition (RSI>=70 on a close already below the 50-day)
@@ -73,7 +74,7 @@ class ScoringTests(unittest.TestCase):
     def test_degraded_high_low_is_reported(self):
         d = frame().drop(columns=["tlt_high", "tlt_low"])
         s = ns.scan(d)
-        self.assertTrue(any("swing conditions degraded" in n for n in s.notes))
+        self.assertTrue(any("2 stack bits degraded" in n for n in s.notes))
 
     def test_gate_blocks_a_high_score_when_legs_disagree(self):
         """Score alone never fires: yields and futures must agree."""
@@ -83,6 +84,57 @@ class ScoringTests(unittest.TestCase):
             self.assertLess(d["y30"].iloc[-1], ns.sma(d["y30"], 50).iloc[-1])
         if s.verdict.endswith("PUTS") and s.verdict != "FADE / SCOUT PUTS":
             self.assertGreater(d["y30"].iloc[-1], ns.sma(d["y30"], 50).iloc[-1])
+
+
+class RevisedRuleTests(unittest.TestCase):
+    """The four fixes against the revised draft."""
+
+    def test_bounce_hook_fires_on_a_real_cross(self):
+        """`last > 35 <= prev` chains to (last>35) and (35<=prev), demanding RSI
+        was ALREADY above 35 — the opposite of a hook. A genuine washout that
+        crosses back up through 35 must trigger."""
+        n = 300
+        idx = pd.bdate_range("2024-01-01", periods=n)
+        # long drift down into a washout, then a sharp two-day snap back
+        rng = np.random.default_rng(11)
+        decline = 100 + np.cumsum(rng.normal(-0.10, 0.45, n - 1))
+        path = np.concatenate([decline, [decline[-1] * 1.045]])
+        d = pd.DataFrame({"tlt": path, "tlt_high": path * 1.004, "tlt_low": path * 0.996,
+                          "y30": np.linspace(4.0, 4.6, n), "y10": np.linspace(3.5, 4.0, n),
+                          "ub": np.nan}, index=idx)
+        r = ns.rsi(pd.Series(path))
+        self.assertLess(r.iloc[-10:].min(), 32, "fixture must actually be oversold")
+        s = ns.scan(d)
+        self.assertIn(s.verdict, {"RENT CALL BOUNCE", "SCOUT TLT CALLS", "BUY TLT CALLS"},
+                      f"a real RSI hook should register, got {s.verdict!r}")
+
+    def test_regime_is_normalised_to_full_scale_without_ub(self):
+        """Six terms span +/-75; a fixed +/-25 threshold would silently tighten."""
+        d = frame(with_ub=True)
+        with_ub = ns.scan(d)
+        without = ns.scan(d.assign(ub=np.nan))
+        for s in (with_ub, without):
+            self.assertLessEqual(abs(s.regime_pts), 100.0)
+        # an all-bullish tape must read +100 on either path, not +75
+        n = 300
+        idx = pd.bdate_range("2024-01-01", periods=n)
+        up = np.linspace(80, 120, n)
+        d2 = pd.DataFrame({"tlt": up, "tlt_high": up * 1.004, "tlt_low": up * 0.996,
+                           "y30": np.linspace(5.0, 3.5, n), "y10": np.linspace(4.5, 3.0, n),
+                           "ub": np.nan}, index=idx)
+        self.assertAlmostEqual(ns.scan(d2).regime_pts, 100.0, places=6)
+
+    def test_missing_30y_is_a_clear_error_not_a_crash(self):
+        d = frame()
+        with self.assertRaises((ValueError, KeyError, IndexError)):
+            ns.scan(d.iloc[:10])
+
+    def test_ub_absent_is_reported_and_never_proxied(self):
+        s = ns.scan(frame().assign(ub=np.nan))
+        self.assertIsNone(s.ub)
+        self.assertTrue(any("max out at 6/8" in n for n in s.notes))
+        self.assertLessEqual(s.call_stack, 6)
+        self.assertLessEqual(s.put_stack, 6)
 
 
 if __name__ == "__main__":
