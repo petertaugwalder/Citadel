@@ -1055,16 +1055,22 @@ def allocator_snapshot(frames: dict) -> dict:
 
 
 def run_stress(frames: dict, blocks: int = 4, costs=(1.0, 5.0, 10.0),
-               variant: int = 1) -> dict:
+               variant: int = 1, start: str | None = None) -> dict:
     """Sensitivity test:
     split the history into contiguous sub-periods, re-run at several cost levels, and
-    report whether the vs-buy-and-hold edge survives every leg or straddles zero."""
-    runner = lambda **kw: backtest(frames, variant=variant, **kw)  # noqa: E731
+    report whether the vs-buy-and-hold edge survives every leg or straddles zero.
+    `start` windows every leg and the FULL row alike, so --from means the same thing
+    here as it does for --backtest."""
+    runner = lambda **kw: backtest(frames, variant=variant, **{"start": start, **kw})  # noqa: E731
     full = runner(cost_bps=costs[0])
     if "error" in full:
         return full
     st = daily_state(frames)
     idx = st[st["ready"]].index
+    if start:
+        idx = idx[idx >= pd.Timestamp(start)]
+    if len(idx) < blocks * 2:
+        return {"error": f"only {len(idx)} sessions in the window — too few for {blocks} blocks"}
     edges = [idx[int(len(idx) * i / blocks)] for i in range(blocks)] + [idx[-1]]
 
     rows = []
@@ -1530,7 +1536,7 @@ def main() -> int:
         if args.demo and not args.json:
             print(f"\n{YEL}{BOLD}[DEMO DATA — synthetic tape, results validate the pipeline, not the strategy]{END}")
         if args.stress:
-            res = run_stress(frames, blocks=args.blocks)
+            res = run_stress(frames, blocks=args.blocks, start=args.from_date)
             print(json.dumps(res, indent=2, default=str)) if args.json else render_stress(res)
         elif args.ablate:
             res = run_ablation(frames, start=args.from_date)
