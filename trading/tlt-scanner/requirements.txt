@@ -2,3 +2,6 @@ pandas>=2.2
 numpy>=1.26
 rich>=13.0
 yfinance>=0.2.40
+
+# optional: only used by nightly_scorecard.py if yfinance fails
+# polygon-api-client>=1.14

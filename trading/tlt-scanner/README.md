@@ -151,6 +151,25 @@ The bounce is now a tape signal only — it is never presented as a new entry.
 Judge the allocator with `--ablate`, which compares all four variants at 1bp
 and 5bp on the same window; every variant is in-sample.
 
+## Nightly scorecard (`nightly_scorecard.py`)
+
+A separate single-file tool: weighted score, regime, both stacks, one verdict, no
+levels and no backtest. It shares no code with `tlt_scanner.py` and **can disagree
+with it** — the weights are coarser and the verdict vocabulary finer (SCOUT vs BUY,
+RENT CALL BOUNCE, FADE). Use the scanner for levels, stops and the replay; use this
+for a fast nightly read.
+
+```bash
+python nightly_scorecard.py                    # last ~800 days
+python nightly_scorecard.py --start 2020-01-01 --json
+```
+
+Score range is **-12..+11**, not symmetric: the bear-steepener term only ever
+subtracts. Thresholds stay at ±5. Falls back to Polygon (`pip install polygon-api-client`)
+if yfinance fails; without a real UB feed the inverted-30Y proxy is displayed but
+**scores zero**, because it is algebraically the same test as the yield leg — scoring
+it would count one fact twice and collapse the two-source gate into one.
+
 ## Web dashboard (`webapp.py`)
 
 The same engines rendered as a page instead of terminal panels — useful on a
@@ -252,6 +271,7 @@ python tlt_scanner.py --options
 ## Files
 
 - `tlt_scanner.py` — everything (single file, no project structure needed)
+- `nightly_scorecard.py` — standalone one-page CALLS/PUTS/STAND ASIDE read
 - `schwab_client.py` — Schwab OAuth, price history, option chains
 - `test_price_basis.py` — locks the raw-levels / distribution-accounting split
 - `test_fetch_shape.py` — locks the Schwab fetch/cache contract (raw OHLC + `TR`)
