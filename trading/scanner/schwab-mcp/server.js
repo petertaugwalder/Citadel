@@ -168,7 +168,9 @@ export function flattenChain(body, { limit = 60 } = {}) {
             strike: Number(strike),
             bid: numOrNull(c.bid), ask: numOrNull(c.ask), last: numOrNull(c.last),
             mark: numOrNull(c.mark),
-            delta: numOrNull(c.delta), iv: numOrNull(c.volatility),
+            delta: numOrNull(c.delta), gamma: numOrNull(c.gamma),
+            theta: numOrNull(c.theta), vega: numOrNull(c.vega), rho: numOrNull(c.rho),
+            iv: numOrNull(c.volatility),
             openInterest: numOrNull(c.openInterest), volume: numOrNull(c.totalVolume),
             inTheMoney: c.inTheMoney ?? null,
           });
@@ -282,8 +284,9 @@ function buildServer() {
     title: 'Get Schwab option chain',
     description:
       'Option chain for one symbol, flattened to the columns that matter for a trade: strike, ' +
-      'expiration, days to expiry, bid/ask/mark, delta, implied volatility, open interest and ' +
-      'volume. Filter with contractType, strikeCount and a date range to keep it small.',
+      'expiration, days to expiry, bid/ask/mark, the full greeks Schwab publishes (delta, gamma, ' +
+      'theta, vega, rho), implied volatility, open interest and volume. Filter with contractType, ' +
+      'strikeCount and a date range to keep it small.',
     inputSchema: z.object({
       symbol: z.string().min(1),
       contractType: z.enum(['CALL', 'PUT', 'ALL']).default('CALL'),
@@ -405,7 +408,9 @@ function selftest() {
   const chain = flattenChain({
     callExpDateMap: {
       '2026-09-19:22': {
-        '28.0': [{ bid: 1.2, ask: 1.4, last: 1.3, mark: 1.3, delta: 0.52, volatility: 31.2, openInterest: 400, totalVolume: 25, inTheMoney: true }],
+        '28.0': [{ bid: 1.2, ask: 1.4, last: 1.3, mark: 1.3, delta: 0.52, gamma: 0.06,
+                   theta: -0.0071, vega: 0.0412, rho: 0.0139, volatility: 31.2,
+                   openInterest: 400, totalVolume: 25, inTheMoney: true }],
         '30.0': [{ bid: 0.5, ask: 0.7, delta: 0.28, volatility: 33.0, openInterest: 900, totalVolume: 60 }],
       },
     },
@@ -415,6 +420,9 @@ function selftest() {
   t('respects limit and flags truncation', chain.rows.length === 2 && chain.truncated === true);
   t('sorted by expiration then strike', chain.rows[0].strike === 26 && chain.rows[0].type === 'PUT');
   t('greeks carried through', chain.rows[1].delta === 0.52 && chain.rows[1].iv === 31.2);
+  t('theta, vega and rho carried through',
+    chain.rows[1].theta === -0.0071 && chain.rows[1].vega === 0.0412 && chain.rows[1].rho === 0.0139);
+  t('absent second-order greeks become null', chain.rows[0].theta === null);
   t('missing numerics become null', flattenChain({
     callExpDateMap: { '2026-09-19:22': { '28.0': [{ bid: 'n/a' }] } } }).rows[0].bid === null);
 
