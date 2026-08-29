@@ -33,13 +33,13 @@ class SchwabOnlyDataTests(unittest.TestCase):
             "TLT": pd.DataFrame({"Close": prices}, index=idx),
             "TYX": pd.DataFrame({"Close": yields}, index=idx),
         }
-        d, live, source = ts.fetch_duration(frames)
+        d, live, source = ts.fetch_duration(frames, provider="Schwab")
         self.assertTrue(live)
         self.assertAlmostEqual(d, 15.0, places=6)
         self.assertIn("Schwab", source)
 
     def test_duration_fails_closed_without_both_schwab_series(self):
-        d, live, source = ts.fetch_duration({})
+        d, live, source = ts.fetch_duration({}, provider="Schwab")
         self.assertTrue(math.isnan(d))
         self.assertFalse(live)
         self.assertIn("unavailable", source)

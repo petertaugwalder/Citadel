@@ -47,17 +47,20 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-# Schwab symbol and the divisor that turns its quote into displayed units.
-# Schwab serves yield indices in index points ($TYX 52.0 == 5.20%), prices as-is.
+# Per-provider symbol and the divisor that turns its quote into displayed units.
+# Yahoo quotes yields directly (^TYX 5.20); Schwab serves index points ($TYX 52.0).
 TICKERS = {  # the watchlist — the only rows shown on the tape
-    "TLT": ("TLT", 1.0),    # duration leg: 20+yr Treasury ETF, traded on the stack/bounce engine
-    "UB": ("/UB", 1.0),     # Ultra Bond futures: primary futures tape (25y+ basket, tightest match to TLT's book)
-    "TYX": ("$TYX", 10.0),  # 30y yield index (drives TLT, inverted)
+    # name:      yahoo         schwab
+    "TLT": {"yahoo": ("TLT", 1.0), "schwab": ("TLT", 1.0)},     # duration leg: 20+yr Treasury ETF
+    "UB": {"yahoo": ("UB=F", 1.0), "schwab": ("/UB", 1.0)},     # Ultra Bond futures (25y+ basket)
+    "TYX": {"yahoo": ("^TYX", 1.0), "schwab": ("$TYX", 10.0)},  # 30y yield (drives TLT, inverted)
 }
 AUX_TICKERS = {  # fetched quietly as derived inputs — never shown as watchlist rows,
                  # never required: a scan runs fine with any or all of these missing
-    "TNX": ("$TNX", 10.0),  # 10y yield: private input for the 10s30s display one-liner (no curve trade)
+    "TNX": {"yahoo": ("^TNX", 1.0), "schwab": ("$TNX", 10.0)},  # 10y: private 10s30s input only
 }
+SOURCES = ("yahoo", "schwab")
+DEFAULT_SOURCE = "yahoo"  # free and unauthenticated; Schwab needs a weekly login
 CACHE_DIR = Path.home() / ".cache" / "tlt-scanner"
 CACHE_TTL_SEC = 4 * 3600
 HISTORY_YEARS = 20  # Schwab pricehistory takes a date range; 20y covers TLT's whole listed life
@@ -141,6 +144,48 @@ def to_32nds(x: float) -> str:
 # ----------------------------------------------------------------------------- data layer
 
 
+def fetch_yahoo(symbol: str) -> pd.DataFrame | None:
+    """Raw (unadjusted) OHLC plus a total-return column.
+
+    Every level the scanner prints or signals on is a raw price, so the 50/200-day
+    and the EMAs match the chart the trade is actually placed against. Dividend
+    back-adjustment would drag them low in proportion to the lookback -- on TLT's
+    ~4.2% distribution yield that is ~1.7% on the 200-day, enough to call a regime
+    flip more than a point early. The adjusted close is kept alongside as `TR` and
+    is used only to account for distributions in --backtest returns.
+    """
+    import logging
+
+    import yfinance as yf
+
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    try:
+        df = yf.download(symbol, period="max", interval="1d",
+                         auto_adjust=False, progress=False, threads=False)
+        if df is None or df.empty:
+            df = yf.Ticker(symbol).history(period="max", interval="1d", auto_adjust=False)
+    except Exception as exc:  # network / proxy / API failures degrade per-ticker
+        print(f"  ! fetch failed for {symbol}: {exc}", file=sys.stderr)
+        return None
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns=str.title).rename(columns={"Adj Close": "TR"})
+    cols = [c for c in ("Open", "High", "Low", "Close", "TR") if c in df.columns]
+    if "Close" not in cols:
+        return None
+    df = df[cols].dropna(subset=["Close"])
+    for c in ("Open", "High", "Low"):
+        if c not in df.columns:
+            df[c] = df["Close"]
+    if "TR" not in df.columns:  # non-distributing series (yields, futures)
+        df["TR"] = df["Close"]
+    df["TR"] = df["TR"].ffill().fillna(df["Close"])
+    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+    return df
+
+
 def fetch_schwab(symbol: str, scale: float = 1.0) -> pd.DataFrame | None:
     """Daily OHLC from the Schwab Trader API, in displayed units.
 
@@ -182,18 +227,24 @@ def fetch_schwab(symbol: str, scale: float = 1.0) -> pd.DataFrame | None:
     return out if len(out) else None
 
 
-def load_frames(refresh: bool = False) -> dict[str, pd.DataFrame]:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def load_frames(refresh: bool = False, source: str = DEFAULT_SOURCE) -> dict[str, pd.DataFrame]:
+    """Load every series from one provider. Caches are per-provider: the two feeds
+    disagree on units and on dividend adjustment, so they must never share a file."""
+    if source not in SOURCES:
+        raise ValueError(f"unknown source {source!r}; expected one of {SOURCES}")
+    cache_dir = CACHE_DIR / source
+    cache_dir.mkdir(parents=True, exist_ok=True)
     frames: dict[str, pd.DataFrame] = {}
-    for name, (symbol, scale) in {**TICKERS, **AUX_TICKERS}.items():
-        cache = CACHE_DIR / f"{name}.csv"
+    for name, per_source in {**TICKERS, **AUX_TICKERS}.items():
+        symbol, scale = per_source[source]
+        cache = cache_dir / f"{name}.csv"
         df = None
         if cache.exists() and not refresh and (time.time() - cache.stat().st_mtime) < CACHE_TTL_SEC:
             df = pd.read_csv(cache, index_col=0, parse_dates=True)
             if "TR" not in df.columns:  # pre-raw-price cache: adjusted closes stored as Close
                 df = None
         if df is None or df.empty:
-            df = fetch_schwab(symbol, scale)
+            df = fetch_yahoo(symbol) if source == "yahoo" else fetch_schwab(symbol, scale)
             if df is not None:
                 df.to_csv(cache)
             elif cache.exists():
@@ -241,7 +292,7 @@ def demo_frames() -> dict[str, pd.DataFrame]:
     return {k: enrich(_demo_walk(rng, n, s, seg, v)) for k, (s, seg, v) in shapes.items()}
 
 
-def fetch_duration(frames: dict) -> tuple[float, bool, str]:
+def fetch_duration(frames: dict, provider: str = "Yahoo") -> tuple[float, bool, str]:
     """TLT duration estimated from the tape, or nothing at all.
 
     Schwab publishes no issuer Effective Duration, and no other vendor is
@@ -254,7 +305,7 @@ def fetch_duration(frames: dict) -> tuple[float, bool, str]:
     """
     tlt, tyx = frames.get("TLT"), frames.get("TYX")
     if tlt is None or tyx is None or "Close" not in tlt or "Close" not in tyx:
-        return float("nan"), False, "unavailable (Schwab TLT/$TYX pair not loaded)"
+        return float("nan"), False, f"unavailable ({provider} TLT/30y-yield pair not loaded)"
 
     window = 63  # a quarter of sessions: long enough to fit, short enough to stay current
     ret = tlt["Close"].astype(float).pct_change()
@@ -262,7 +313,7 @@ def fetch_duration(frames: dict) -> tuple[float, bool, str]:
     pair = pd.concat([ret, dy], axis=1, keys=["ret", "dy"]).dropna()
     pair = pair[pair["dy"] != 0].tail(window)
     if len(pair) < 20:
-        return float("nan"), False, "unavailable (too few overlapping TLT/$TYX sessions)"
+        return float("nan"), False, "unavailable (too few overlapping TLT/30y-yield sessions)"
 
     x, y = pair["dy"].to_numpy(), pair["ret"].to_numpy()
     var = float(((x - x.mean()) ** 2).sum())
@@ -276,7 +327,7 @@ def fetch_duration(frames: dict) -> tuple[float, bool, str]:
     if not (5 < d < 30):
         return (float("nan"), False,
                 f"unavailable (fitted D={d:.1f} outside a credible 5-30 range)")
-    return d, True, f"Schwab {len(pair)}-session empirical beta, n={len(pair)}, R²={r2:.2f}"
+    return d, True, f"{provider} {len(pair)}-session empirical beta, n={len(pair)}, R²={r2:.2f}"
 
 
 # ----------------------------------------------------------------------------- analysis
@@ -1495,6 +1546,8 @@ def main() -> int:
                     help="run the 4-variant ablation (current / no-SCOUT / no-trail / allocator) at 1bp and 5bp")
     ap.add_argument("--from", dest="from_date", metavar="YYYY-MM-DD",
                     help="start the backtest/ablation window at this date (earlier data used for warmup)")
+    ap.add_argument("--source", choices=SOURCES, default=DEFAULT_SOURCE,
+                    help=f"market-data provider (default {DEFAULT_SOURCE}; schwab needs a weekly login)")
     ap.add_argument("--explain", action="store_true", help="print the trading logic and exit")
     args = ap.parse_args()
 
@@ -1503,9 +1556,11 @@ def main() -> int:
         return 0
 
     if args.backtest or args.ablate:
-        frames = demo_frames() if args.demo else load_frames(refresh=args.refresh)
+        frames = demo_frames() if args.demo else load_frames(refresh=args.refresh, source=args.source)
         if "TLT" not in frames:
-            print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
+            print(f"ERROR: could not load TLT data from {args.source}. Try --demo to test the "
+                  "pipeline" + (", or --source yahoo (no login needed)."
+                                if args.source == "schwab" else "."), file=sys.stderr)
             return 1
         if args.demo and not args.json:
             print(f"\n{YEL}{BOLD}[DEMO DATA — synthetic tape, results validate the pipeline, not the strategy]{END}")
@@ -1524,12 +1579,14 @@ def main() -> int:
     def one_scan(prev: tuple[str, str] | None = None) -> tuple[dict | None, tuple[str, str] | None]:
         # --watch must see fresh bars every cycle; the 4h cache would otherwise serve stale data
         force = args.refresh or bool(args.watch)
-        frames = demo_frames() if args.demo else load_frames(refresh=force)
+        frames = demo_frames() if args.demo else load_frames(refresh=force, source=args.source)
         if "TLT" not in frames:
-            print("ERROR: could not load TLT data (network blocked?). Try --demo to test the pipeline.", file=sys.stderr)
+            print(f"ERROR: could not load TLT data from {args.source}. Try --demo to test the "
+                  "pipeline" + (", or --source yahoo (no login needed)."
+                                if args.source == "schwab" else "."), file=sys.stderr)
             return None, None
         dur = ((float("nan"), False, "demo data has no effective duration")
-               if args.demo else fetch_duration(frames))
+               if args.demo else fetch_duration(frames, provider=args.source.capitalize()))
         res = analyze(frames, account=args.account, risk_pct=args.risk, entry=args.entry, duration=dur)
         if args.allocate:
             res["allocator"] = allocator_snapshot(frames)

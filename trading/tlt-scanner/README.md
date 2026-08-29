@@ -6,8 +6,9 @@ Terminal scanner for swing-trading **TLT** (iShares 20+ Year Treasury ETF), with
 on top** (binary gate, details below).
 Tape rows: **TLT / UB / $TYX** (the duration triangle). Fetched quietly as a
 derived input, never shown as a row: **$TNX** (10s30s one-liner).
-Daily (end-of-day) histories and option chains come from the Schwab Trader API
-only and are cached locally. There is no alternate market-data vendor fallback.
+Daily (end-of-day) histories come from **Yahoo Finance by default** — free, no
+account, no login. `--source schwab` switches to the Schwab Trader API once you
+have logged in; option chains are Schwab-only. Caches are per-provider.
 Built for iTerm — rich TUI dashboard with a plain-ANSI fallback.
 
 > Decision support, not financial advice. Signals fire on daily closes; act the
@@ -20,9 +21,7 @@ cd trading/tlt-scanner
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-python schwab_client.py login     # one-time browser auth; re-run weekly
-
-python tlt_scanner.py             # one-shot scan (live data)
+python tlt_scanner.py             # one-shot scan (live data, no login needed)
 python tlt_scanner.py --explain   # the trading logic, in the terminal
 ```
 
@@ -41,6 +40,7 @@ python tlt_scanner.py --explain   # the trading logic, in the terminal
 | `python tlt_scanner.py --json` | Machine-readable output for piping |
 | `python tlt_scanner.py --alert-exit` | Exit code 2 on a BUY, 3 on an EXIT — for scripting/cron |
 | `python tlt_scanner.py --demo` | Synthetic data (no network) to see the output shape |
+| `python tlt_scanner.py --source schwab` | Use the Schwab Trader API instead of Yahoo (needs `schwab_client.py login`) |
 | `--refresh` / `--plain` | Force re-download / force plain ANSI output |
 
 Cache lives in `~/.cache/tlt-scanner/` (4h TTL), so repeated runs are instant.
@@ -84,9 +84,8 @@ boolean.
 
 ## Backtest verdicts (real data)
 
-> **Stale — different data source.** The figures below came from
-> dividend-adjusted Yahoo bars. The scanner now reads raw Schwab prints, so both
-> the levels and the return series differ. Re-run `--backtest` for current
+> **Stale.** The figures below came from dividend-adjusted bars; levels are now
+> raw and returns count distributions separately. Re-run `--backtest` for current
 > numbers; the shape of the conclusion does not change.
 
 **TLT, full history 2010-10-25 → 2026-08-27** (3984 sessions, 1bp/side):
@@ -192,13 +191,16 @@ python tlt_scanner.py --options
   lookback: on TLT's ~4.2% distribution yield that is ~1.7% on the 200-day
   (~1.4 points), enough to call a regime flip more than a point before any chart
   shows it. Schwab serves raw prints, so this is what arrives.
-- **Returns are price-only, and the backtest says so.** Schwab publishes no
-  adjusted close and no historical distribution series, so the `TR` column
-  equals `Close` and `--backtest` measures price return on **both** the strategy
-  and buy-and-hold. That understates holding TLT by its entire dividend stream —
-  a caveat line states this on every run rather than passing price return off as
-  total return. The plumbing for real total return is intact: give `TR` a
-  genuine total-return series and both sides pick it up automatically.
+- **Returns are total return where the feed allows it.** Yahoo publishes
+  `Adj Close`, kept as the `TR` column, so `--backtest` accounts for
+  distributions on **both** the strategy and buy-and-hold — leaving them out
+  would flatter the strategy against the dividend it competes with. Schwab
+  publishes no adjusted close, so under `--source schwab` the `TR` column equals
+  `Close` and returns are price-only. The backtest prints which of the two it
+  measured on every run; it never passes price return off as total return.
+- **Two providers, two caches.** The feeds disagree on units (Yahoo quotes
+  `^TYX` at 5.20, Schwab quotes `$TYX` at 52.0) and on dividend adjustment, so
+  `~/.cache/tlt-scanner/{yahoo,schwab}/` never share a file.
 - **Duration math is first-order only.** Schwab does not publish issuer
   Effective Duration. D-beta is therefore estimated from 63 sessions of
   Schwab TLT returns versus Schwab $TYX yield changes, with sample size and
@@ -243,6 +245,6 @@ python tlt_scanner.py --options
 - Local web dashboard (webapp.py): same engines, browser UI, /api JSON, phone-friendly.
 - SCHD removed entirely; the scanner is TLT / UB / ^TYX only.
 - Levels and signals moved to raw (unadjusted) prices so they match the chart.
-- Market data switched to the Schwab Trader API; yfinance removed entirely.
-  Duration is now an empirical TLT/$TYX beta fitted from the Schwab tape, and
-  backtest returns are price-only because Schwab publishes no adjusted close.
+- Market data is provider-switchable via `--source`, defaulting to Yahoo (free,
+  no login); `--source schwab` uses the Trader API. Duration is an empirical
+  TLT/30y-yield beta fitted from whichever tape is loaded, with n and R² printed.
