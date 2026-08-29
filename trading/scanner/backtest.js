@@ -27,6 +27,20 @@
  *   node backtest.js --dump bars.csv       fetch and save raw bars, then report
  *   node backtest.js --dump bars.csv --monthly   month-end closes only (small)
  *   node backtest.js --load bars.csv       report from a saved file, no network
+ *
+ * Data source is Yahoo by default. --source schwab uses the Schwab Trader API
+ * instead, reading credentials from the environment and never from a file in
+ * this repo:
+ *
+ *   export SCHWAB_APP_KEY=...        from developer.schwab.com
+ *   export SCHWAB_APP_SECRET=...
+ *   export SCHWAB_REFRESH_TOKEN=...  from your OAuth callback, ~7 day life
+ *   node backtest.js --source schwab
+ *
+ * Schwab candles are NOT distribution-adjusted, so total return and CAGR for a
+ * fund that pays out (DBA yields ~3%) understate the real figure. Yahoo's
+ * adjusted close is the better series for return math; Schwab is the better
+ * match for what your broker screen shows.
  */
 'use strict';
 
@@ -34,6 +48,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const TICKERS = ['WEAT', 'CORN', 'SOYB', 'CANE', 'DBA'];
+const SCHWAB_TOKEN_URL = 'https://api.schwabapi.com/v1/oauth/token';
+const SCHWAB_HISTORY_URL = 'https://api.schwabapi.com/marketdata/v1/pricehistory';
 const HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
@@ -103,6 +119,83 @@ function parseDaily(result) {
     bars.push({ date: new Date(ts[i] * 1000).toISOString().slice(0, 10), close: c });
   }
   return bars;
+}
+
+// ── Schwab Trader API ───────────────────────────────────────────────────────
+
+// Exchanges the refresh token for a short-lived access token. Credentials come
+// from the environment only; nothing here logs or returns them.
+async function schwabAccessToken() {
+  const key = process.env.SCHWAB_APP_KEY;
+  const secret = process.env.SCHWAB_APP_SECRET;
+  const refresh = process.env.SCHWAB_REFRESH_TOKEN;
+  const missing = [
+    !key && 'SCHWAB_APP_KEY',
+    !secret && 'SCHWAB_APP_SECRET',
+    !refresh && 'SCHWAB_REFRESH_TOKEN',
+  ].filter(Boolean);
+  if (missing.length) {
+    throw new Error(
+      `Schwab credentials missing from the environment: ${missing.join(', ')}. ` +
+      'Set them in your shell (not in a file in this repo) and re-run.',
+    );
+  }
+  const res = await fetch(SCHWAB_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${key}:${secret}`).toString('base64')}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) {
+    // A 400 here is nearly always an expired refresh token: Schwab's lasts 7 days.
+    throw new Error(
+      `Schwab token exchange failed (HTTP ${res.status}). ` +
+      (res.status === 400 || res.status === 401
+        ? 'Refresh tokens expire after about 7 days — re-run your OAuth flow to mint a new one.'
+        : 'Check the app key and secret.'),
+    );
+  }
+  const body = await res.json();
+  if (!body?.access_token) throw new Error('Schwab token response contained no access_token.');
+  return body.access_token;
+}
+
+// Candles carry datetime as epoch milliseconds; some gateways hand back ISO
+// strings instead, so accept either rather than silently dropping every bar.
+function parseSchwabCandles(body) {
+  const candles = body?.candles;
+  if (!Array.isArray(candles)) throw new Error('no candles in response');
+  const bars = [];
+  for (const c of candles) {
+    const close = Number(c?.close);
+    if (!Number.isFinite(close) || close <= 0) continue;
+    const raw = c?.datetime ?? c?.dateTime;
+    const when = typeof raw === 'number' ? new Date(raw)
+      : typeof raw === 'string' ? new Date(/^\d+$/.test(raw) ? Number(raw) : raw)
+      : null;
+    if (!when || Number.isNaN(when.getTime())) continue;
+    bars.push({ date: when.toISOString().slice(0, 10), close });
+  }
+  bars.sort((a, b) => a.date.localeCompare(b.date));
+  return bars;
+}
+
+async function fetchDailySchwab(symbol, token) {
+  const qs = new URLSearchParams({
+    symbol, periodType: 'year', period: '20',
+    frequencyType: 'daily', frequency: '1', needExtendedHoursData: 'false',
+  }).toString();
+  const res = await fetch(`${SCHWAB_HISTORY_URL}?${qs}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`Schwab price history HTTP ${res.status}`);
+  const body = await res.json();
+  if (body?.empty) throw new Error('Schwab returned an empty series');
+  return parseSchwabCandles(body);
 }
 
 // ── statistics ──────────────────────────────────────────────────────────────
@@ -288,8 +381,8 @@ function correlate(barsA, barsB) {
 
 // ── report sections ─────────────────────────────────────────────────────────
 
-function printSummary(data) {
-  console.log(paint('\nSUMMARY — full history, distribution-adjusted', C.bold));
+function printSummary(data, adjusted = true) {
+  console.log(paint(`\nSUMMARY — full history, ${adjusted ? 'distribution-adjusted' : 'unadjusted prices'}`, C.bold));
   console.log(paint(
     '  ' + rpad('TKR', 6) + lpad('bars', 6) + '  ' + rpad('from', 11) +
     lpad('last', 8) + lpad('ATH', 9) + '  ' + rpad('on', 11) +
@@ -487,7 +580,7 @@ function loadBars(file) {
 
 // ── self-test ───────────────────────────────────────────────────────────────
 
-function runCheck() {
+async function runCheck() {
   let pass = 0, fail = 0;
   const t = (name, cond) => {
     if (cond) { pass++; console.log(`  ok   ${name}`); }
@@ -560,6 +653,42 @@ function runCheck() {
   t('no overlap -> null',
     correlate(a, [bar('1999-01-01', 5), bar('1999-01-02', 6)]) === null);
 
+  console.log('schwab');
+  const epochBody = { candles: [
+    { datetime: Date.UTC(2024, 0, 3, 14, 30), open: 1, close: 20.5 },
+    { datetime: Date.UTC(2024, 0, 2, 14, 30), open: 1, close: 20.0 },
+    { datetime: Date.UTC(2024, 0, 4, 14, 30), close: null },
+    { datetime: Date.UTC(2024, 0, 5, 14, 30), close: 0 },
+  ] };
+  const sb = parseSchwabCandles(epochBody);
+  t('epoch-ms candles parsed and sorted',
+    sb.length === 2 && sb[0].date === '2024-01-02' && approx(sb[1].close, 20.5));
+  t('null and non-positive closes dropped', sb.every((b) => b.close > 0));
+  const isoBars = parseSchwabCandles({ candles: [{ datetime: '2024-03-05T14:30:00Z', close: 9 }] });
+  t('ISO datetime candles parsed', isoBars.length === 1 && isoBars[0].date === '2024-03-05');
+  const strEpoch = parseSchwabCandles({ candles: [{ datetime: String(Date.UTC(2024, 5, 6)), close: 3 }] });
+  t('numeric-string datetime parsed', strEpoch.length === 1 && strEpoch[0].date === '2024-06-06');
+  t('unparseable datetime dropped',
+    parseSchwabCandles({ candles: [{ datetime: 'never', close: 5 }] }).length === 0);
+  let schwabErr = null;
+  try { parseSchwabCandles({ notCandles: [] }); } catch (e) { schwabErr = e.message; }
+  t('missing candles rejected', /no candles/.test(schwabErr ?? ''));
+  const savedEnv = ['SCHWAB_APP_KEY', 'SCHWAB_APP_SECRET', 'SCHWAB_REFRESH_TOKEN']
+    .map((k) => [k, process.env[k]]);
+  for (const [k] of savedEnv) delete process.env[k];
+  let credErr = null;
+  schwabAccessToken().catch((e) => { credErr = e.message; });
+  await new Promise((r) => setImmediate(r));
+  t('missing credentials named explicitly',
+    /SCHWAB_APP_KEY/.test(credErr ?? '') && /SCHWAB_REFRESH_TOKEN/.test(credErr ?? ''));
+  process.env.SCHWAB_APP_KEY = 'k';
+  process.env.SCHWAB_APP_SECRET = 'sensitive-secret-value';
+  credErr = null;
+  schwabAccessToken().catch((e) => { credErr = e.message; });
+  await new Promise((r) => setImmediate(r));
+  t('secrets never echoed in errors', !/sensitive-secret-value/.test(credErr ?? ''));
+  for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+
   console.log('dump / load round trip');
   const tmp = path.join(require('node:os').tmpdir(), `bt-check-${process.pid}.csv`);
   const rt = [
@@ -601,6 +730,7 @@ function runCheck() {
 
 async function main() {
   if (hasFlag('--check')) return runCheck();
+
   const want = flagValue('--ticker', '').toUpperCase();
   const tickers = want ? want.split(',').map((s) => s.trim()).filter(Boolean) : TICKERS;
   const from = flagValue('--from', null);
@@ -609,19 +739,33 @@ async function main() {
   const loadFile = flagValue('--load', null);
   const dumpFile = flagValue('--dump', null);
 
+  const source = flagValue('--source', 'yahoo').toLowerCase();
+  if (!['yahoo', 'schwab'].includes(source)) {
+    console.error(`--source: expected yahoo or schwab, got ${source}`);
+    process.exit(1);
+  }
+
   let loaded = null;
   if (loadFile) {
     loaded = loadBars(path.resolve(loadFile));
     process.stdout.write(`Loaded ${loadFile} — ${[...loaded.keys()].join(' ')}\n`);
   } else {
-    process.stdout.write(`Fetching full daily history for ${tickers.join(' ')}…\n`);
+    process.stdout.write(
+      `Fetching full daily history for ${tickers.join(' ')} from ${source}…\n`);
+  }
+  let schwabToken = null;
+  if (!loaded && source === 'schwab') {
+    schwabToken = await schwabAccessToken();
+    process.stdout.write('  Schwab access token obtained\n');
   }
   const symbols = loaded ? [...loaded.keys()].filter((s) => !want || tickers.includes(s)) : tickers;
 
   const data = [];
   for (const sym of symbols) {
     try {
-      let bars = loaded ? loaded.get(sym) : await fetchDaily(sym);
+      let bars = loaded ? loaded.get(sym)
+        : source === 'schwab' ? await fetchDailySchwab(sym, schwabToken)
+        : await fetchDaily(sym);
       if (from) bars = bars.filter((b) => b.date >= from);
       if (bars.length < 60) throw new Error(`only ${bars.length} bars`);
       data.push({
@@ -644,13 +788,17 @@ async function main() {
         '--load that file here.');
     process.exit(1);
   }
+  if (!loaded && source === 'schwab') {
+    console.log(paint('\nSchwab candles are not distribution-adjusted: total return and CAGR ' +
+      'below exclude distributions (DBA yields ~3%). Use the Yahoo source for return math.', C.dim));
+  }
   if (periodsPerYear(data[0].bars) === 12) {
     console.log(paint('\nMonth-end data: volatility is annualized from monthly returns, and ' +
       'high/low/drawdown are month-end extremes rather than intraday.', C.dim));
   }
 
   const show = (name) => section === 'all' || section === name;
-  if (show('summary')) printSummary(data);
+  if (show('summary')) printSummary(data, source !== 'schwab' || !!loaded);
   if (show('years')) printYears(data);
   if (show('months')) printMonths(data);
   if (show('seasonality')) printSeasonality(data);

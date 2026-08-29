@@ -101,6 +101,28 @@ writes summary/monthly/yearly/seasonality CSVs for a spreadsheet. Seasonal
 averages over ~15 observations per month are suggestive, not predictive — read
 the hit rate next to the average before trusting either.
 
+### Using the Schwab API instead of Yahoo
+
+```
+export SCHWAB_APP_KEY=...
+export SCHWAB_APP_SECRET=...
+export SCHWAB_REFRESH_TOKEN=...
+node backtest.js --source schwab
+```
+
+App key and secret come from an app registered at developer.schwab.com with the
+Market Data product enabled; the refresh token comes from running that app's
+OAuth flow once. Keep all three in your shell or a password manager — never in
+this repo, and never pasted into a chat. Refresh tokens last about seven days,
+and an expired one shows up as an HTTP 400 on the token exchange.
+
+Schwab candles are **not distribution-adjusted**. For a fund that pays out — DBA
+yields ~3% — total return and CAGR from Schwab understate the real figure, and
+the summary header says `unadjusted prices` when that source is in use. Yahoo's
+adjusted close is the better series for return math; Schwab matches what your
+broker screen shows. `--source schwab --dump bars.csv` combines, so you can pull
+from Schwab and analyze the file anywhere.
+
 ### Running it where the network can't reach Yahoo
 
 Split the fetch from the analysis. On a machine that can reach Yahoo:
