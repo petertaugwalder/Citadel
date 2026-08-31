@@ -1,7 +1,10 @@
 {
   "pollSeconds": 15,
   "offPollSeconds": 60,
-  "quoteHosts": ["query1.finance.yahoo.com", "query2.finance.yahoo.com"],
+  "quoteHosts": [
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com"
+  ],
   "nearPct": 0.35,
   "hysteresisPct": 0.1,
   "alertCooldownMin": 25,
@@ -17,11 +20,26 @@
     "enabled": true,
     "voice": true,
     "map": {
-      "buy-dip": { "file": "/System/Library/Sounds/Glass.aiff", "repeat": 2 },
-      "buy-breakout": { "file": "/System/Library/Sounds/Hero.aiff", "repeat": 3 },
-      "stop-warn": { "file": "/System/Library/Sounds/Basso.aiff", "repeat": 3 },
-      "close-warn": { "file": "/System/Library/Sounds/Sosumi.aiff", "repeat": 2 },
-      "chime": { "file": "/System/Library/Sounds/Ping.aiff", "repeat": 1 }
+      "buy-dip": {
+        "file": "/System/Library/Sounds/Glass.aiff",
+        "repeat": 2
+      },
+      "buy-breakout": {
+        "file": "/System/Library/Sounds/Hero.aiff",
+        "repeat": 3
+      },
+      "stop-warn": {
+        "file": "/System/Library/Sounds/Basso.aiff",
+        "repeat": 3
+      },
+      "close-warn": {
+        "file": "/System/Library/Sounds/Sosumi.aiff",
+        "repeat": 2
+      },
+      "chime": {
+        "file": "/System/Library/Sounds/Ping.aiff",
+        "repeat": 1
+      }
     }
   },
   "tickers": {
@@ -30,37 +48,56 @@
       "stop": "ema20",
       "breakout": null,
       "closeWarnBelow": 19.2,
-      "fallbackLevels": { "ema20": 18.55, "sma50": 17.76, "sma200": 17.88 },
-      "note": "price discovery · most stretched (RSI ~79) · close <19.20 = failed breakout · golden cross pending"
+      "fallbackLevels": {
+        "ema20": 18.76,
+        "sma50": 17.87,
+        "sma200": 17.9
+      },
+      "note": "price discovery · 19.95, RSI 74.7 · golden cross still pending: 50d 17.87 vs 200d 17.90, three cents apart · close <19.20 = failed breakout"
     },
     "WEAT": {
       "dipEntry": 26.4,
       "stop": "ema20",
       "breakout": null,
-      "fallbackLevels": { "ema20": 24.99, "sma50": 24.04, "sma200": 22.49 },
-      "note": "double-top breakout · measured move ~28.5-29 · trail = 20-EMA"
+      "fallbackLevels": {
+        "ema20": 25.42,
+        "sma50": 24.23,
+        "sma200": 22.56
+      },
+      "note": "28.00, +43% off the Apr-2026 decade low near 19.6 but still ~56% under the Mar-2022 spike · RSI 78.9 · trail = 20-EMA"
     },
     "SOYB": {
       "dipEntry": 26.3,
       "stop": "ema20",
       "breakout": null,
-      "fallbackLevels": { "ema20": 25.76, "sma50": 25.26, "sma200": 24.05 },
-      "note": "orderly staircase to new highs · least fragile"
+      "fallbackLevels": {
+        "ema20": 25.96,
+        "sma50": 25.36,
+        "sma200": 24.09
+      },
+      "note": "27.20, RSI 75.3 · steadiest fundamentals (China floor) but its option chain is untradeable — median spread ~100% · express this in shares, not calls"
     },
     "CANE": {
       "dipEntry": "ema20",
       "stop": "sma200",
       "breakout": 11.5,
-      "fallbackLevels": { "ema20": 10.75, "sma50": 10.05, "sma200": 9.74 },
-      "note": "11.0-11.4 flag above reclaimed 200-day · >11.50 resumes trend · India-ban/ethanol trade"
+      "fallbackLevels": {
+        "ema20": 10.83,
+        "sma50": 10.13,
+        "sma200": 9.76
+      },
+      "note": "11.21, the only one that fell on 28-Aug · trades India/Brazil/ethanol, not the Black Sea, so it does not confirm the grain trade · >11.50 resumes the trend"
     },
     "DBA": {
       "dipEntry": "ema20",
       "stop": "sma50",
-      "breakout": 28.8,
-      "breakoutNote": "Sector breadth confirmed — entire ag complex at new highs.",
-      "fallbackLevels": { "ema20": 28.03, "sma50": 27.59, "sma200": 26.68 },
-      "note": "sector tell · 28.80 = May-high trigger · most room to run (RSI 65)"
+      "breakout": null,
+      "fallbackLevels": {
+        "ema20": 28.19,
+        "sma50": 27.68,
+        "sma200": 26.72
+      },
+      "note": "29.19 — the 28.80 May-high trigger FIRED on 28-Aug, breadth confirmed · now in price discovery, no overhead · sector tell, manage on the 20-EMA/50-day"
     }
   }
 }
