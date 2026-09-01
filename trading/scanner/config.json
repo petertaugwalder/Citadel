@@ -53,7 +53,7 @@
         "sma50": 17.87,
         "sma200": 17.9
       },
-      "note": "price discovery · 19.95, RSI 74.7 · golden cross still pending: 50d 17.87 vs 200d 17.90, three cents apart · close <19.20 = failed breakout"
+      "note": "Dec corn CONTRACT HIGH 537'6 on 31-Aug with open interest UP 0.90% — new money, not short covering · CVL 26.02 vs 30d realised 33.03: implied vol is 7 pts UNDER realised, so calls are cheap vs how much it is actually moving · skew collapsed to a 1wk low 2.88 · close <19.20 = failed breakout"
     },
     "WEAT": {
       "dipEntry": 26.4,
@@ -64,7 +64,7 @@
         "sma50": 24.23,
         "sma200": 22.56
       },
-      "note": "28.00, +43% off the Apr-2026 decade low near 19.6 but still ~56% under the Mar-2022 spike · RSI 78.9 · trail = 20-EMA"
+      "note": "CAUTION: Dec wheat -1.28% to 774'0 on 31-Aug while corn and beans made contract highs, and open interest FELL · WVL crushed 2.6 to 43.51 while 30d realised rose to 37.91 — implied still ~5.6 pts OVER realised, so long calls bleed vega as the spike deflates · RSI was 78.9 · trail the 20-EMA"
     },
     "SOYB": {
       "dipEntry": 26.3,
@@ -75,7 +75,7 @@
         "sma50": 25.36,
         "sma200": 24.09
       },
-      "note": "27.20, RSI 75.3 · steadiest fundamentals (China floor) but its option chain is untradeable — median spread ~100% · express this in shares, not calls"
+      "note": "Nov beans CONTRACT HIGH 1288'0 on 31-Aug, total OI at a 1mo high · SVL 20.11 vs realised 19.97, fairly priced · strongest fundamentals (China floor) but the option chain is untradeable, median spread ~100% — express this in shares"
     },
     "CANE": {
       "dipEntry": "ema20",
