@@ -22,15 +22,18 @@ Requires Node ≥ 18 (`node --version`). Or from the repo root: `npm run scan`.
 | WEAT | 26.40 (broken double top) | 20-EMA trail (live) | — new highs | |
 | SOYB | 26.30 (breakout shelf) | 20-EMA (live) | — new highs | |
 | CANE | 20-EMA touch (live) | 200-day (live) | **11.50** flag resolution | |
-| DBA | 20-EMA touch (live) | 50-day (live) | **28.80** May high | breakout alert notes sector-wide breadth confirmation |
+| DBA | 20-EMA touch (live) | 50-day (live) | — price discovery | 28.80 fired 28-Aug at 29.19; breadth confirmed, trigger retired |
 
 Levels written as `"ema20"`, `"sma50"`, `"sma200"` in `config.json` are
 recomputed **live** from Yahoo daily data each poll (current price folded in
 as today's forming close, like an intraday chart), so trailing references
 track the tape without manual edits. Fixed numbers (19.20, 26.40, 26.30,
-11.50, 28.80) are structural levels — edit `config.json` as the trade
-evolves. `fallbackLevels` (chart values as of 2026-08-26) are used only when
-daily history can't be fetched; the dashboard marks them with `~`.
+11.50) are structural levels — edit `config.json` as the trade evolves. Retire
+a trigger once it fires, or it re-alerts `[active at startup]` on every restart.
+`fallbackLevels` (chart values as of 2026-08-28) are used only when daily
+history can't be fetched; the dashboard marks them with `~`. Note the source
+charts print EMA(21) where the config key is `ema20` — immaterial for a
+fallback, but not identical.
 
 If a rising trailing stop climbs above a fixed entry, the buy zone follows
 the stop (shown with `^`) — refresh the config when that happens.
@@ -40,7 +43,7 @@ the stop (shown with `^`) — refresh the config when that happens.
 | Alert | Meaning | Default sound |
 |---|---|---|
 | `BUY-DIP` | price pulled back into the buy zone `[stop … entry]` (or reclaimed it from below) | Glass ×2 |
-| `BUY-BREAKOUT` | price took out the overhead trigger (CANE 11.50, DBA 28.80) | Hero ×3 |
+| `BUY-BREAKOUT` | price took out the overhead trigger (CANE 11.50) | Hero ×3 |
 | `STOP-WARN` | price lost the stop reference — manage open calls | Basso ×3 |
 | `CLOSE-WARN` | CORN under 19.20 after 15:45 NY — failed-breakout risk into the close | Sosumi ×2 |
 | `CHIME` | session open/close | Ping ×1 |
