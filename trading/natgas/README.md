@@ -108,3 +108,36 @@ quote stamps side by side. Two runs already showed the field rolls between 17:38
 ```
 python3 -m unittest test_natgas_fix -v
 ```
+
+## restart-scanner.sh
+
+Finds and restarts the desk's `commodity-scanner.js`. No placeholders to fill in:
+angle brackets are redirection operators in zsh, so a command containing `<label>`
+or `<that directory>` fails with "no such file or directory" before it runs.
+
+```
+./restart-scanner.sh              # stop it if running, start it, verify it came up
+./restart-scanner.sh --status     # report only, change nothing
+./restart-scanner.sh --stop       # stop and leave stopped
+```
+
+It prefers launchd when a LaunchAgent in `~/Library/LaunchAgents` references the
+script, because a hand-started process dies with its terminal. Otherwise it starts
+the scanner with `nohup` from the script's own directory and logs to
+`~/Library/Logs/commodity-scanner.log`.
+
+A process counts as the scanner only when its command line names the file **and**
+its executable is node. Matching the command line alone also catches this script,
+an editor with the file open, and a `tail` on its log.
+
+Override with environment variables: `SCANNER_JS`, `SCANNER_ARGS`, `SCANNER_LOG_DIR`.
+
+### Refreshing the regime data
+
+`gas_alerts.json` is a separate input. The tracker fails closed when it is older
+than 36 hours. Regenerate it from the pipeline directory:
+
+```
+cd "$HOME/Energy&Commodity Desk/pipeline"
+python3 gas_alerts.py
+```
