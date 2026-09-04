@@ -95,3 +95,5 @@ docs/FACELIFT_PLAN.md
 # AG call scanner runtime files (trading/ag_call_scanner.py)
 trading/alerts.log
 trading/scanner_state.json
+__pycache__/
+*.pyc
