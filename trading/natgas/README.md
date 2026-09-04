@@ -15,7 +15,43 @@ Standard library only, Python 3.9+. Copy `natgas_fix.py` next to the tracker.
 | 18 weekdays left | 17 trading days | Labor Day |
 | 42th pctile, "at the BOTTOM" | 42nd, "NEW LOW below its range" | 0.124 < range low 0.129 |
 
-`python3 natgas_fix.py --demo` prints the corrected HEADLINE / VEHICLES block for that run.
+`python3 natgas_fix.py --demo` prints the corrected HEADLINE / VEHICLES blocks for the
+09-02 run and the 09-04 run.
+
+## Measured Schwab behaviour (09-02 18:55 ET and 09-04 07:59 ET runs)
+
+- **The index stand-ins are live quotes with a same-day base.** At 07:59 ET on 09-04,
+  $DJCING printed +0.34%, exactly /NGV26 2.923 against its 09-03 settle 2.913. At 18:55 ET
+  on 09-02 both stand-ins printed +1.79%, exactly 3.009 against the 09-02 settle 2.956.
+  So `futures_last / (index_last / index_close)` is the same-day settle, to about a tick.
+- **The futures closePrice rolls the next morning.** The 09-04 run carried `settleTime`
+  09-04 07:53 ET with the 09-03 settle. On the evening of 09-02 the field was stamped
+  17:38 ET but still held the 09-01 value, so `settleTime` is a posted-at stamp, not the
+  settlement date. The module maps it to a session by the calendar and never trusts it alone.
+- **Dating a settle by matching its value against history is a dead end.** The 09-04 run
+  called 2.913 "ambiguous" because 08-27 also settled there. The calendar says the last
+  settled session at 07:59 ET on 09-04 is 09-03, and the index-implied value confirms it.
+
+## How `resolve_settle` decides
+
+It gathers three pieces of evidence and returns a `Settle` with `price`, `session`,
+`source`, `stale_sessions`, `basis` ("day" or "2-session") and `notes` that say which
+evidence decided. Print the notes.
+
+1. `known={session_date: settle}` if you keep your own settle log. Highest priority.
+2. The index-implied same-day settle from $DJCING / $SPGSNG (still Schwab-only). It is
+   used only while the index holds the same contract: business days 1-4 of the month for
+   the M+1 contract, 10+ for M+2; the 5th-9th are the roll and are refused. Two stand-ins
+   that disagree by more than 2 ticks are not used.
+   - agrees with Schwab's field and nothing says the field is stale: Schwab **confirmed**.
+   - agrees, but it is the settle evening and the field equals closePrice: no confirmation,
+     because an index whose base has not rolled lands exactly on the stale close.
+   - disagrees: Schwab is one session behind, the index-implied value is used, **unless** a
+     persisted closePrice proves the field rolled, in which case Schwab is kept and the note
+     tells you to check the index roll window.
+3. Otherwise `settleTime`'s session and a persisted `closePrice` decide the staleness, and
+   with no evidence at all it is ASSUMED: one session behind on the settle evening, current
+   from the next session on. The notes say so.
 
 ## Wiring into natgas_tracker.py
 
@@ -35,16 +71,16 @@ settle = resolve_settle(
     ngv26_payload,                       # the Schwab quote dict you already fetch for /NGV26
     now,
     contract=contract_from_symbol("/NGV26"),
-    index_quotes={"$DJCING": djcing_quote, "$SPGSNG": spgsng_quote},   # the stand-ins you already fetch
+    index_quotes={"$DJCING": djcing_quote, "$SPGSNG": spgsng_quote},   # pass the whole quote dicts
     prev_close_seen=state.get("closePrice_prev_session"),             # see "persist" below
 )
 for line in render_headline("/NGV26", last, settle, oi, now):
     print("     " + line)
 
-# 3. vehicles: same window on both sides of the ratio
-_, ng_settle_pct = change(settle.price, settle.schwab_close) if settle.stale_sessions == 0 else (None, float("nan"))
-print(render_vehicle("UNG", ung_last, ung_chg, ung_vol, ng_settle_pct, leverage=1.0))
-print(render_vehicle("BOIL", boil_last, boil_chg, boil_vol, ng_settle_pct, leverage=2.0))
+# 3. vehicles: both legs over the same two timestamps. Best: the futures 16:00 -> 16:00
+#    print you already keep for the last completed session. Else settle-to-settle.
+print(render_vehicle("UNG", ung_last, ung_chg, ung_vol, ng_1600_pct, 1.0, ng_window="16:00->16:00"))
+print(render_vehicle("BOIL", boil_last, boil_chg, boil_vol, ng_1600_pct, 2.0, ng_window="16:00->16:00"))
 
 # 4. curve / spreads: label the basis instead of calling it "the day's change"
 hdr = "chg% vs today's settle" if settle.stale_sessions == 0 else f"chg% vs settle-{settle.stale_sessions} ({settle.basis})"
@@ -54,37 +90,18 @@ print(range_position(spread_now, lo, hi, rank_pctile(spread_now, history), len(h
 print(days_to_expiry(now_et.date(), ng_expiry_for("/NGV26")).render())
 ```
 
-`resolve_settle` returns a `Settle` with `price`, `session`, `source`, `stale_sessions`,
-`basis` ("day" or "2-session") and `notes`. Print the notes: they say which evidence
-decided the basis. Its priority order:
-
-1. `known={session_date: settle}` if you keep your own settle log.
-2. Schwab's field when `settleTime` stamps it as the same session and `closePrice`
-   moved since the previous session's run.
-3. The same-day settle derived from a Schwab single-commodity index stand-in
-   ($DJCING, $SPGSNG) when it holds the same contract (business days 1-4 of the month
-   for the M+1 contract, 10+ for M+2; the 5th-9th are the roll and are refused).
-   Still Schwab-only. Two coincidence traps are refused: an index whose % change
-   equals the live futures move, and two stand-ins that disagree by more than 2 ticks.
-4. Schwab's stale value, honestly labelled `2-session`.
-
-Without `settleTime` or a persisted `closePrice`, staleness is ASSUMED: one session behind
-on the same evening (the measured 09-02 behaviour), current from the next session on.
-The notes say so.
-
 ### Persist closePrice per run
 
 Write `settle.schwab_close` and `settle.session` to the tracker's state file each run and
-pass the previous session's value back as `prev_close_seen`. When the value has not moved
-across a settlement, Schwab has not rolled, whatever `settleTime` says.
+pass the previous session's value back as `prev_close_seen`. Unchanged across a settlement
+means Schwab has not rolled; changed means it has, and that outranks a disagreeing index.
 
 ### Diagnostic log
 
-Append `settle_field_report(payload, now)` to a log once per run for a few sessions. It
-prints `closePrice`, `futureSettlementPrice`, `settleTime`, the base Schwab uses for its own
-`netChange`, and the quote stamps side by side, so you can see which field rolls to the new
-settlement and at what time. Once you know, the `known` or `settleTime` path takes over and
-the index derivation is only a cross-check.
+Append `settle_field_report(payload, now)` to a log once per run. It prints `closePrice`,
+`futureSettlementPrice`, `settleTime`, the base Schwab uses for its own `netChange`, and the
+quote stamps side by side. Two runs already showed the field rolls between 17:38 ET and
+07:53 ET the next morning; a few more will pin the hour.
 
 ## Tests
 

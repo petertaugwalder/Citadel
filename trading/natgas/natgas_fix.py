@@ -14,9 +14,10 @@ on 09-02):
     the 09-02 settle (2.956) was published. The tracker printed live-vs-2.904
     (+3.62%) as "the day's change". That is a TWO-session move: the 09-02
     session was +1.79% settle-to-settle and the evening session added +1.79%.
-    -> resolve_settle() finds the same-day settle (Schwab settleTime, a
-       persisted previous closePrice, or the Schwab index stand-ins) and
-       labels every change with its basis ("day" or "2-session").
+    -> resolve_settle() finds the same-day settle: the live Schwab index
+       stand-ins imply it (futures_last / index ratio), which confirms or
+       overrides Schwab's field; settleTime and a persisted closePrice are
+       secondary evidence. Every change is labelled "day" or "2-session".
  2. UNG/BOIL "capture" divided a close-to-close ETF move by that two-session
     futures move -> 0.60x / 0.54x. Against the settle-to-settle move both
     vehicles tracked normally (UNG 1.21x, BOIL 2.20x = 1.10 of its 2x target).
@@ -33,13 +34,14 @@ on 09-02):
     -> ordinal(), range_position(), days_to_expiry().
 
 Run `python3 natgas_fix.py --demo` to see the corrected HEADLINE / VEHICLES
-block for the 2026-09-02 run, and `python3 -m unittest test_natgas_fix` for
+blocks for the 2026-09-02 and 2026-09-04 runs, and `python3 -m unittest test_natgas_fix` for
 the tests.
 """
 from __future__ import annotations
 
 import argparse
 import calendar
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Dict, List, Mapping, Optional, Tuple
@@ -337,6 +339,18 @@ def session_header(now: datetime, etf_close_date: Optional[date] = None) -> str:
 # set to the same window; confirm against the S&P DJI methodology sheet.
 INDEX_ROLL_WINDOW: Dict[str, Tuple[int, int]] = {"$SPGSNG": (5, 9), "$DJCING": (5, 9)}
 
+# Measured on Schwab (runs of 2026-09-02 18:55 ET and 2026-09-04 07:59 ET):
+#  * $DJCING / $SPGSNG are LIVE quotes and their % change is against the index's
+#    SAME-DAY close: 09-04 07:59 ET $DJCING +0.34% = /NGV26 2.923 vs its 09-03
+#    settle 2.913; 09-02 18:55 ET +1.79% = 3.009 vs the 09-02 settle 2.956.
+#  * the futures closePrice rolls to the new settle the NEXT MORNING (settleTime
+#    09-04 07:53 ET carried 2.913). On the evening of the settle it still holds
+#    the previous one (09-02 17:38 ET stamp, value 2.904 = the 09-01 settle).
+#  * settleTime is therefore a posted-at stamp, not the settlement date.
+# Hence the same-day settle implied by a live index is
+#     futures_last / (index_last / index_prior_close)
+# and Schwab's field is confirmed when that agrees with it, overridden when not.
+
 
 def index_contract(symbol: str, d: date) -> Tuple[str, Optional[Tuple[int, int]], int]:
     """Which NG delivery month the index holds on d: ('pre-roll', (y, m), bd),
@@ -358,77 +372,73 @@ def _num(v) -> Optional[float]:
 
 
 def _round_tick(x: float, tick: float = NG_TICK) -> float:
-    return round(round(x / tick) * tick, 6)
+    return round(math.floor(round(x / tick, 6) + 0.5) * tick, 6)
 
 
-def _index_pct(iq) -> Optional[float]:
+def _index_ratio(iq) -> Tuple[Optional[float], str]:
+    """(index_last / index_prior_close, description). The two prices beat the
+    2-decimal percent when both are present."""
     if isinstance(iq, (int, float)):
-        return float(iq)
+        return 1.0 + float(iq) / 100.0, f"{float(iq):+.2f}%"
+    if not isinstance(iq, Mapping):
+        return None, "unusable index quote"
+    q = iq.get("quote", iq)
+    last, close = _num(q.get("lastPrice")), _num(q.get("closePrice"))
+    if last and close:
+        return last / close, f"{last:.2f}/{close:.2f} ({(last / close - 1) * 100:+.2f}%)"
     for key in ("netPercentChange", "netPercentChangeInDouble", "percentChange", "pct"):
-        v = _num(iq.get(key)) if isinstance(iq, Mapping) else None
-        if v is not None:
-            return v
-    return None
+        pct = _num(q.get(key))
+        if pct is not None:
+            return 1.0 + pct / 100.0, f"{pct:+.2f}%"
+    return None, "no percent change in quote"
 
 
 def _index_timestamp(iq) -> Optional[datetime]:
     if not isinstance(iq, Mapping):
         return None
-    stamps = [_epoch_to_et(iq.get(k)) for k in ("tradeTime", "quoteTime", "ts")]
+    q = iq.get("quote", iq)
+    stamps = [_epoch_to_et(q.get(k)) for k in ("tradeTime", "quoteTime", "ts")]
     stamps = [s for s in stamps if s is not None]
     return max(stamps) if stamps else None
 
 
 def derive_settle_from_index(
-    prev_settle: float,
     fut_last: Optional[float],
     idx_quote,
     session: date,
     contract: Tuple[int, int],
     symbol: str,
     *,
-    mode: str = "auto",
+    mode: str = "live",
+    prev_settle: Optional[float] = None,
     tick: float = NG_TICK,
-    published_by: time = NG_SETTLE_PUBLISHED,
 ) -> Tuple[Optional[float], str]:
-    """Same-day settle of `contract` implied by a single-commodity index quote.
+    """Same-day settle of `contract` implied by one index stand-in.
 
-    mode 'close': the index value is its official close (14:30 settlement mark)
-                  and its % change is settle-to-settle  -> prev_settle * (1 + pct)
-    mode 'live' : the index value is live and its % change is vs today's close
-                  -> fut_last / (1 + pct)
-    mode 'auto' : pick by the index quote's own timestamp.
-    Returns (price or None, reason)."""
+    mode 'live'  (Schwab, measured): the index is live and its base is its
+                 same-day close            -> fut_last / (idx_last / idx_close)
+    mode 'close': the index value is its official close and its base is the
+                 previous close            -> prev_settle * (idx_last / idx_close)
+    Returns (price rounded to the tick, reason). Accuracy is about one tick when
+    only the rounded percent is available."""
     state, held, bd = index_contract(symbol, session)
     if held != contract:
         what = f"{held[0]}-{held[1]:02d}" if held else "a blend"
-        return None, f"{symbol}: holds {what} on {session} (business day {bd}, {state}); cannot derive {contract[0]}-{contract[1]:02d}"
-    pct = _index_pct(idx_quote)
-    if pct is None:
-        return None, f"{symbol}: no percent change in quote"
+        return None, (f"{symbol}: holds {what} on {session} (business day {bd}, {state}); "
+                      f"cannot derive {contract[0]}-{contract[1]:02d}")
+    ratio, desc = _index_ratio(idx_quote)
+    if ratio is None or ratio <= 0:
+        return None, f"{symbol}: {desc}"
     ts = _index_timestamp(idx_quote)
-    if mode == "auto":
-        if ts is None:
-            mode, why = "close", "no timestamp, assumed official close"
-        elif ts.date() < session:
-            return None, f"{symbol}: value stamped {stamp(ts)} predates the {session} settlement"
-        elif ts.date() == session and ts.time() <= (datetime.combine(session, published_by) + timedelta(hours=1)).time():
-            mode, why = "close", f"stamped {stamp(ts, utc=False)}"
-        else:
-            mode, why = "live", f"stamped {stamp(ts, utc=False)}"
-    else:
-        why = "mode forced"
+    if ts is not None and ts < datetime.combine(session, NG_SETTLE, tzinfo=ET):
+        return None, f"{symbol}: value stamped {stamp(ts, utc=False)} predates the {session} settlement"
     if mode == "close":
-        derived = _round_tick(prev_settle * (1 + pct / 100.0), tick)
-        if fut_last is not None and abs(derived - fut_last) <= tick:
-            return None, f"{symbol}: {pct:+.2f}% equals the live futures move; its base is as stale as closePrice"
-        return derived, f"{symbol} {pct:+.2f}% x previous settle {prev_settle:.3f} ({why})"
+        if prev_settle is None:
+            return None, f"{symbol}: close mode needs the previous settle"
+        return _round_tick(prev_settle * ratio, tick), f"{symbol} {desc} x previous settle {prev_settle:.3f} (close mode)"
     if fut_last is None:
         return None, f"{symbol}: live mode needs the futures last price"
-    derived = _round_tick(fut_last / (1 + pct / 100.0), tick)
-    if abs(derived - prev_settle) <= tick:
-        return None, f"{symbol}: live {pct:+.2f}% spans the same two-session window as closePrice"
-    return derived, f"live {fut_last:.3f} / (1 {pct:+.2f}%) via {symbol} ({why})"
+    return _round_tick(fut_last / ratio, tick), f"futures {fut_last:.3f} / {symbol} {desc}"
 
 
 @dataclass
@@ -460,7 +470,7 @@ def resolve_settle(
     known: Optional[Mapping[date, float]] = None,
     index_quotes: Optional[Mapping[str, object]] = None,
     prev_close_seen: Optional[float] = None,
-    index_mode: str = "auto",
+    index_mode: str = "live",
     tick: float = NG_TICK,
     published_by: time = NG_SETTLE_PUBLISHED,
 ) -> Settle:
@@ -470,10 +480,12 @@ def resolve_settle(
                     (a bare quote dict also works).
     contract        (year, month) of delivery, e.g. contract_from_symbol('/NGV26').
     known           {session_date: settle} you trust (your own settle log). Highest priority.
-    index_quotes    {'$DJCING': quote_dict_or_pct, ...} single-commodity index stand-ins,
-                    used to derive the same-day settle when Schwab's field is a session behind.
+    index_quotes    {'$DJCING': quote_dict_or_pct, ...} single-commodity index stand-ins.
+                    Their live value implies the same-day settle; it confirms Schwab's
+                    field when the two agree and replaces it when they do not.
     prev_close_seen closePrice recorded on a run whose last_settled_session was the
-                    previous session. Equal to today's closePrice => Schwab has not rolled.
+                    previous session. Equal to today's closePrice => Schwab has not rolled;
+                    different => it has.
     """
     now_et = to_et(now)
     session = last_settled_session(now_et, published_by)
@@ -494,50 +506,83 @@ def resolve_settle(
         notes.append(f"futureSettlementPrice {fsp:.3f} != closePrice {close:.3f}; using {schwab_field}")
     if schwab is None:
         return Settle(None, None, "none", 0, close, st, notes + ["no closePrice/futureSettlementPrice in payload"])
+    schwab_src = f"schwab:{schwab_field}"
+    same_evening = now_et.date() == session and now_et.time() >= published_by
 
-    stale: Optional[int] = None
+    # evidence 1: settleTime. A posted-at stamp; only the session it maps to is informative.
+    st_stale: Optional[int] = None
     if st is not None:
         st_session = st.date() if st.time() == time(0, 0) and is_business_day(st.date()) else last_settled_session(st, NG_SETTLE)
-        stale = sessions_between(st_session, session)
-        notes.append(f"settleTime {stamp(st, utc=False)} -> {st_session} settle ({stale} session(s) behind)")
-    if prev_close_seen is not None and close is not None and abs(close - prev_close_seen) <= tick / 2:
-        if stale == 0:
-            notes.append("settleTime claims same-day but closePrice is unchanged since the previous session; treating as stale")
-        stale = max(stale or 0, 1)
-        notes.append(f"closePrice {close:.3f} unchanged since the previous session's run")
-    if stale is None:
-        same_evening = now_et.date() == session and now_et.time() >= published_by
-        stale = 1 if same_evening else 0
-        notes.append("staleness ASSUMED (no settleTime, no prev_close_seen): "
-                     + ("same evening -> Schwab one session behind, as measured 2026-09-02" if same_evening
-                        else "later session -> Schwab field taken as current"))
+        st_stale = sessions_between(st_session, session)
+        notes.append(f"settleTime {stamp(st, utc=False)} (posted-at) -> {st_session} session, {st_stale} behind")
 
-    if stale == 0:
-        return Settle(schwab, session, f"schwab:{schwab_field}", 0, close, st, notes)
+    # evidence 2: did closePrice move since the previous session's run?
+    unchanged = prev_close_seen is not None and close is not None and abs(close - prev_close_seen) <= tick / 2
+    rolled = prev_close_seen is not None and close is not None and not unchanged
+    if unchanged:
+        notes.append(f"closePrice {close:.3f} unchanged since the previous session's run: Schwab has not rolled")
+    elif rolled:
+        notes.append(f"closePrice moved {prev_close_seen:.3f} -> {close:.3f} since the previous session's run: Schwab has rolled")
 
-    if stale == 1 and index_quotes:
-        derived: List[Tuple[str, float]] = []
+    # evidence 3: the same-day settle implied by the live index stand-ins
+    derived: Optional[float] = None
+    derived_src = ""
+    if index_quotes:
+        found: List[Tuple[str, float]] = []
         for sym, iq in index_quotes.items():
-            price, why = derive_settle_from_index(schwab, last, iq, session, contract, sym,
-                                                  mode=index_mode, tick=tick, published_by=published_by)
+            price, why = derive_settle_from_index(last, iq, session, contract, sym, mode=index_mode, prev_settle=schwab, tick=tick)
             notes.append(why)
             if price is not None:
-                derived.append((sym, price))
-        if derived:
-            prices = [p for _, p in derived]
+                found.append((sym, price))
+        if found:
+            prices = [p for _, p in found]
             if max(prices) - min(prices) <= 2 * tick:
-                price = _round_tick(sum(prices) / len(prices), tick)
-                src = "derived:" + "/".join(s for s, _ in derived)
-                prev_session = prev_business_day(session)
-                notes.append(f"Schwab {schwab_field} {schwab:.3f} = {prev_session.strftime('%m-%d')} settle (1 session stale)")
-                return Settle(price, session, src, 0, close, st, notes)
-            notes.append("index stand-ins disagree by more than 2 ticks: " + ", ".join(f"{s} {p:.3f}" for s, p in derived))
+                derived = _round_tick(sum(prices) / len(prices), tick)
+                derived_src = "derived:" + "/".join(s for s, _ in found)
+            else:
+                notes.append("index stand-ins disagree by more than 2 ticks, not used: " + ", ".join(f"{s} {p:.3f}" for s, p in found))
 
+    if derived is not None:
+        agree = abs(derived - schwab) <= 2 * tick
+        if agree:
+            known_stale = unchanged or (st_stale or 0) >= 1
+            # On the settle evening an index that lands exactly on closePrice has a base
+            # as stale as closePrice (or the evening is dead flat): not a confirmation.
+            ambiguous = same_evening and not rolled and (close is None or abs(schwab - close) <= tick / 2)
+            if not known_stale and not ambiguous:
+                notes.append(f"index-implied {derived:.3f} confirms Schwab {schwab_field} {schwab:.3f} as the {session} settle")
+                return Settle(schwab, session, schwab_src, 0, close, st, notes)
+            notes.append(f"index-implied {derived:.3f} equals Schwab's value while it is "
+                         + ("known" if known_stale else "presumed") + " stale: the index base has not rolled either")
+        elif rolled and (st_stale is None or st_stale == 0):
+            notes.append(f"index-implied {derived:.3f} disagrees with Schwab {schwab:.3f}, but closePrice rolled since "
+                         f"the previous session: keeping Schwab; check {derived_src[8:]} against its roll window")
+            return Settle(schwab, session, schwab_src, 0, close, st, notes)
+        else:
+            prev_session = prev_business_day(session)
+            notes.append(f"Schwab {schwab_field} {schwab:.3f} = {prev_session.strftime('%m-%d')} settle (one session behind); "
+                         f"using index-implied {derived:.3f}")
+            return Settle(derived, session, derived_src, 0, close, st, notes)
+
+    # no usable index reading: decide from the other evidence
+    if unchanged:
+        stale = max(st_stale or 0, 1)
+    elif st_stale is not None:
+        stale = st_stale
+    elif rolled:
+        stale = 0
+    else:
+        stale = 1 if same_evening else 0
+        notes.append("staleness ASSUMED (no settleTime, no prev_close_seen, no index): "
+                     + ("same evening -> Schwab one session behind, as measured 2026-09-02" if same_evening
+                        else "later session -> Schwab field taken as current, as measured 2026-09-04"))
+    if stale == 0:
+        return Settle(schwab, session, schwab_src, 0, close, st, notes)
     older = session
     for _ in range(stale):
         older = prev_business_day(older)
     notes.append(f"{stale} session(s) stale: changes vs this value are {stale + 1}-session moves")
-    return Settle(schwab, older, f"schwab:{schwab_field}", stale, close, st, notes)
+    return Settle(schwab, older, schwab_src, stale, close, st, notes)
 
 
 def settle_field_report(payload: Mapping, now: datetime) -> str:
@@ -582,28 +627,32 @@ class Capture:
     leverage: float
     raw: Optional[float]        # ETF move / NG move
     of_target: Optional[float]  # raw / leverage, 1.0 = tracked its target exactly
+    ng_window: str = "settle-to-settle"
 
     def render(self) -> str:
         if self.raw is None:
-            return f"capture n/a (NG settle-to-settle {self.ng_pct:+.2f}%, too small to divide by)"
+            return f"capture n/a (NG {self.ng_window} {self.ng_pct:+.2f}%, too small to divide by)"
         return (f"capture {self.raw:.2f}x of NG (target {self.leverage:.1f}x)"
-                f" = {self.of_target:.2f} of target · NG settle-to-settle {self.ng_pct:+.2f}%")
+                f" = {self.of_target:.2f} of target · NG {self.ng_window} {self.ng_pct:+.2f}%")
 
 
-def capture(etf_pct: float, ng_settle_pct: float, leverage: float = 1.0, min_abs_ng_pct: float = 0.25) -> Capture:
-    """Same-window capture: ETF close-to-close vs futures settle-to-settle.
-    Never divide a 16:00 ET ETF move by a live evening-session futures quote."""
-    if abs(ng_settle_pct) < min_abs_ng_pct:
-        return Capture(etf_pct, ng_settle_pct, leverage, None, None)
-    raw = etf_pct / ng_settle_pct
-    return Capture(etf_pct, ng_settle_pct, leverage, raw, raw / leverage)
+def capture(etf_pct: float, ng_pct: float, leverage: float = 1.0, min_abs_ng_pct: float = 0.25,
+            ng_window: str = "settle-to-settle") -> Capture:
+    """Same-window capture. Both legs must span the same two timestamps: an ETF
+    close-to-close (16:00 ET) against the futures over 16:00 -> 16:00 when you have
+    that print, else against settle-to-settle (14:30). Never divide an ETF close
+    move by a live evening-session futures quote."""
+    if abs(ng_pct) < min_abs_ng_pct:
+        return Capture(etf_pct, ng_pct, leverage, None, None, ng_window)
+    raw = etf_pct / ng_pct
+    return Capture(etf_pct, ng_pct, leverage, raw, raw / leverage, ng_window)
 
 
 # ----------------------------------------------------------------------------
 # 5. Formatting
 # ----------------------------------------------------------------------------
 def ordinal(n) -> str:
-    n = int(round(float(n)))
+    n = int(math.floor(float(n) + 0.5))
     suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{n}{suffix}"
 
@@ -629,7 +678,7 @@ def range_position(value: float, lo: float, hi: float, rank_pct: float, n_rows: 
 
 
 # ----------------------------------------------------------------------------
-# 6. Renderers for the two blocks that were wrong, and a demo of the 09-02 run
+# 6. Renderers for the blocks that were wrong, and a demo of the two measured runs
 # ----------------------------------------------------------------------------
 def render_headline(symbol: str, last: float, settle: Settle, oi: Optional[int], now: datetime) -> List[str]:
     y, m = contract_from_symbol(symbol)
@@ -652,14 +701,16 @@ def render_headline(symbol: str, last: float, settle: Settle, oi: Optional[int],
     return lines
 
 
-def render_vehicle(name: str, last: float, chg: float, volume: Optional[int], ng_settle_pct: float, leverage: float) -> str:
+def render_vehicle(name: str, last: float, chg: float, volume: Optional[int], ng_pct: float, leverage: float,
+                   ng_window: str = "settle-to-settle") -> str:
     prev = last - chg
     pct = chg / prev * 100.0
-    cap = capture(pct, ng_settle_pct, leverage)
+    cap = capture(pct, ng_pct, leverage, ng_window=ng_window)
     vol = f" vol {volume:,}" if volume is not None else ""
     return f"{name:<5} {last:.2f}  {chg:+.2f} ({pct:+.2f}%){vol} · {cap.render()}"
 
 
+# Run 1: 2026-09-02 18:55 ET. Schwab closePrice still on the 09-01 settle.
 DEMO_NOW = datetime(2026, 9, 2, 22, 55, tzinfo=UTC)
 DEMO_NGV26 = {
     "quote": {"lastPrice": 3.009, "closePrice": 2.904, "netChange": 0.105, "futurePercentChange": 3.62, "openInterest": 326958},
@@ -669,26 +720,46 @@ DEMO_INDEX = {"$DJCING": {"lastPrice": 160.74, "netPercentChange": 1.79},
               "$SPGSNG": {"lastPrice": 138.40, "netPercentChange": 1.79}}
 DEMO_ETFS = [("UNG", 10.81, 0.23, 12_196_777, 1.0), ("BOIL", 21.39, 0.81, 4_072_032, 2.0)]
 
+# Run 2: 2026-09-04 07:59 ET. closePrice rolled to the 09-03 settle at 07:53 ET.
+DEMO2_NOW = datetime(2026, 9, 4, 11, 59, tzinfo=UTC)
+DEMO2_NGV26 = {
+    "quote": {"lastPrice": 2.923, "closePrice": 2.913, "openInterest": 310695,
+              "settleTime": int(datetime(2026, 9, 4, 7, 53, tzinfo=ET).timestamp() * 1000)},
+    "reference": {"futureSettlementPrice": 2.913},
+}
+DEMO2_INDEX = {"$DJCING": {"lastPrice": 158.95, "netPercentChange": 0.34},
+               "$SPGSNG": {"lastPrice": 136.90, "netPercentChange": 0.38}}
+# last completed session 09-02 -> 09-03, both legs 16:00 ET -> 16:00 ET (the tracker's own prints)
+DEMO2_CAPTURE = [("UNG", -2.33, 1.0), ("BOIL", -5.16, 2.0)]
+DEMO2_NG_1600 = -2.44
+
 
 def demo() -> str:
+    out: List[str] = []
+    # run 1
     settle = resolve_settle(DEMO_NGV26, DEMO_NOW, contract=contract_from_symbol("/NGV26"), index_quotes=DEMO_INDEX)
-    out = [f"NATGAS TRACKER (fixed basis) · {session_header(DEMO_NOW)}", "", "  HEADLINE"]
+    out += [f"RUN 1 · {session_header(DEMO_NOW)}", "", "  HEADLINE"]
     out += ["     " + l for l in render_headline("/NGV26", 3.009, settle, 326958, DEMO_NOW)]
-    out += ["", "  VEHICLES"]
-    if settle.price is not None and settle.schwab_close is not None and settle.stale_sessions == 0:
-        _, ng_pct = change(settle.price, settle.schwab_close)
-    else:
-        ng_pct = float("nan")
+    out += ["", "  VEHICLES (settle-to-settle window; the 16:00 -> 16:00 futures print is better when you have it)"]
+    ng_pct = change(settle.price, settle.schwab_close)[1] if settle.stale_sessions == 0 else float("nan")
     for name, last, chg, vol, lev in DEMO_ETFS:
         out.append("     " + render_vehicle(name, last, chg, vol, ng_pct, lev))
-    out.append("     window: ETF close-to-close (16:00 ET) vs NG settle-to-settle (14:30 ET); the live quote is not in the ratio")
-    out += ["", "  DIAGNOSTIC (append one per run to learn when Schwab rolls the settle field)",
-            "     " + settle_field_report(DEMO_NGV26, DEMO_NOW)]
+    out += ["", "  DIAGNOSTIC", "     " + settle_field_report(DEMO_NGV26, DEMO_NOW), ""]
+    # run 2
+    settle2 = resolve_settle(DEMO2_NGV26, DEMO2_NOW, contract=contract_from_symbol("/NGV26"),
+                             index_quotes=DEMO2_INDEX, prev_close_seen=2.904)
+    out += [f"RUN 2 · {session_header(DEMO2_NOW)}", "", "  HEADLINE"]
+    out += ["     " + l for l in render_headline("/NGV26", 2.923, settle2, 310695, DEMO2_NOW)]
+    out += ["", "  VEHICLES (last completed session 09-02 -> 09-03, both legs 16:00 ET)"]
+    for name, pct, lev in DEMO2_CAPTURE:
+        cap = capture(pct, DEMO2_NG_1600, lev, ng_window="16:00->16:00")
+        out.append(f"     {name:<5} {pct:+.2f}% · {cap.render()}")
+    out += ["", "  DIAGNOSTIC", "     " + settle_field_report(DEMO2_NGV26, DEMO2_NOW)]
     return "\n".join(out)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    ap.add_argument("--demo", action="store_true", help="render the corrected 2026-09-02 HEADLINE/VEHICLES block")
+    ap.add_argument("--demo", action="store_true", help="render the corrected HEADLINE/VEHICLES blocks for the two measured runs")
     args = ap.parse_args()
     print(demo() if args.demo else ap.format_help())

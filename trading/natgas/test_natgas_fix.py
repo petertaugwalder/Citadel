@@ -2,7 +2,7 @@
 import os
 import sys
 import unittest
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -54,6 +54,8 @@ class CalendarTests(unittest.TestCase):
         left = nf.days_to_expiry(date(2026, 9, 2), date(2026, 9, 28))
         self.assertEqual((left.weekdays, left.trading_days, left.holidays), (18, 17, [date(2026, 9, 7)]))
         self.assertEqual(left.render(), "17 trading days left (18 weekdays, 09-07 excluded)")
+        left = nf.days_to_expiry(date(2026, 9, 4), date(2026, 9, 28))
+        self.assertEqual((left.weekdays, left.trading_days), (16, 15))
         self.assertEqual(nf.days_to_expiry(date(2026, 9, 21), date(2026, 9, 28)).render(), "5 trading days left")
 
     def test_business_day_of_month(self):
@@ -70,6 +72,12 @@ class CalendarTests(unittest.TestCase):
         self.assertEqual(nf.sessions_between(date(2026, 9, 2), date(2026, 9, 2)), 0)
         self.assertEqual(nf.sessions_between(date(2026, 9, 3), date(2026, 9, 2)), 0)
 
+    def test_index_contract(self):
+        self.assertEqual(nf.index_contract("$SPGSNG", date(2026, 9, 2)), ("pre-roll", (2026, 10), 2))
+        self.assertEqual(nf.index_contract("$SPGSNG", date(2026, 9, 8))[0], "rolling")
+        self.assertEqual(nf.index_contract("$SPGSNG", date(2026, 9, 15)), ("post-roll", (2026, 11), 10))
+        self.assertEqual(nf.index_contract("$DJCING", date(2026, 12, 2)), ("pre-roll", (2027, 1), 2))
+
 
 class SessionTests(unittest.TestCase):
     def test_globex_trade_date(self):
@@ -77,6 +85,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(nf.globex_trade_date(et(2026, 9, 2, 16, 30)), date(2026, 9, 2))
         self.assertEqual(nf.globex_trade_date(et(2026, 9, 2, 17, 30)), date(2026, 9, 2))
         self.assertEqual(nf.globex_trade_date(et(2026, 9, 3, 2, 0)), date(2026, 9, 3))
+        self.assertEqual(nf.globex_trade_date(et(2026, 9, 4, 7, 59)), date(2026, 9, 4))
         self.assertEqual(nf.globex_trade_date(et(2026, 9, 4, 19, 0)), date(2026, 9, 8))   # Fri night, Mon holiday
         self.assertEqual(nf.globex_trade_date(et(2026, 9, 5, 12, 0)), date(2026, 9, 8))   # Saturday
         self.assertEqual(nf.globex_trade_date(et(2026, 9, 6, 19, 0)), date(2026, 9, 8))   # Sunday open
@@ -94,7 +103,7 @@ class SessionTests(unittest.TestCase):
     def test_ny_session(self):
         self.assertEqual(nf.ny_session(et(2026, 9, 2, 18, 55)), "AFTERHOURS")
         self.assertEqual(nf.ny_session(et(2026, 9, 2, 10, 0)), "RTH")
-        self.assertEqual(nf.ny_session(et(2026, 9, 2, 8, 0)), "PRE")
+        self.assertEqual(nf.ny_session(et(2026, 9, 4, 7, 59)), "PRE")
         self.assertEqual(nf.ny_session(et(2026, 9, 2, 21, 0)), "CLOSED")
         self.assertEqual(nf.ny_session(et(2026, 9, 7, 10, 0)), "CLOSED")
         self.assertEqual(nf.ny_session(et(2026, 9, 5, 10, 0)), "CLOSED")
@@ -103,6 +112,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(nf.last_settled_session(et(2026, 9, 2, 18, 55)), date(2026, 9, 2))
         self.assertEqual(nf.last_settled_session(et(2026, 9, 2, 14, 0)), date(2026, 9, 1))
         self.assertEqual(nf.last_settled_session(et(2026, 9, 2, 14, 45)), date(2026, 9, 2))
+        self.assertEqual(nf.last_settled_session(et(2026, 9, 4, 7, 59)), date(2026, 9, 3))
         self.assertEqual(nf.last_settled_session(et(2026, 9, 5, 12, 0)), date(2026, 9, 4))
         self.assertEqual(nf.last_settled_session(et(2026, 9, 7, 12, 0)), date(2026, 9, 4))
         self.assertEqual(nf.last_settled_session(et(2026, 9, 8, 9, 0)), date(2026, 9, 4))
@@ -110,6 +120,8 @@ class SessionTests(unittest.TestCase):
     def test_session_header(self):
         self.assertEqual(nf.session_header(nf.DEMO_NOW),
                          "09-02 18:55 ET (22:55 UTC) · NY AFTERHOURS · GLOBEX OPEN, trade date 09-03 · ETF prints = 09-02 close")
+        self.assertEqual(nf.session_header(nf.DEMO2_NOW),
+                         "09-04 07:59 ET (11:59 UTC) · NY PRE · GLOBEX OPEN, trade date 09-04 · ETF prints = 09-03 close")
         self.assertIn("GLOBEX BREAK", nf.session_header(et(2026, 9, 2, 17, 30)))
 
 
@@ -142,55 +154,106 @@ class ClockTests(unittest.TestCase):
 
 
 class SettleTests(unittest.TestCase):
-    CONTRACT = (2026, 10)
+    """Fixtures are the two measured runs: 09-02 18:55 ET (Schwab one session
+    behind, index stand-ins live) and 09-04 07:59 ET (Schwab rolled at 07:53)."""
+    OCT = (2026, 10)
 
     def payload(self, **quote):
         q = dict(nf.DEMO_NGV26["quote"])
         q.update(quote)
         return {"quote": q, "reference": dict(nf.DEMO_NGV26["reference"])}
 
-    def test_demo_run_derives_same_day_settle_from_index(self):
-        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes=nf.DEMO_INDEX)
+    # --- run 1: the evening of the settle -------------------------------------
+    def test_run1_index_overrides_stale_close(self):
+        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.OCT, index_quotes=nf.DEMO_INDEX)
         self.assertEqual((s.price, s.session, s.stale_sessions), (2.956, date(2026, 9, 2), 0))
         self.assertEqual(s.source, "derived:$DJCING/$SPGSNG")
-        self.assertEqual(s.basis, "day")
-        self.assertEqual(s.schwab_close, 2.904)
+        self.assertEqual((s.basis, s.schwab_close), ("day", 2.904))
         self.assertAlmostEqual(nf.change(3.009, s.price)[0], 0.053, places=6)
         self.assertAlmostEqual(nf.change(3.009, s.price)[1], 1.79, places=2)
+        self.assertTrue(any("one session behind" in n for n in s.notes))
 
-    def test_same_day_settle_time_uses_schwab_field(self):
+    def test_run1_posted_at_stamp_does_not_rescue_a_stale_value(self):
+        p = self.payload(settleTime=ms(et(2026, 9, 2, 17, 38)))  # the stamp the tracker printed
+        s = nf.resolve_settle(p, nf.DEMO_NOW, contract=self.OCT, index_quotes=nf.DEMO_INDEX, prev_close_seen=2.904)
+        self.assertEqual((s.price, s.stale_sessions, s.source), (2.956, 0, "derived:$DJCING/$SPGSNG"))
+        self.assertTrue(any("has not rolled" in n for n in s.notes))
+        s = nf.resolve_settle(p, nf.DEMO_NOW, contract=self.OCT, index_quotes=nf.DEMO_INDEX)
+        self.assertEqual((s.price, s.stale_sessions), (2.956, 0))
+
+    def test_run1_same_day_settle_field_is_confirmed_by_index(self):
         p = self.payload(settleTime=ms(et(2026, 9, 2, 15, 5)))
         p["reference"]["futureSettlementPrice"] = 2.956
-        s = nf.resolve_settle(p, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes=nf.DEMO_INDEX)
+        s = nf.resolve_settle(p, nf.DEMO_NOW, contract=self.OCT, index_quotes=nf.DEMO_INDEX)
         self.assertEqual((s.price, s.session, s.stale_sessions, s.source), (2.956, date(2026, 9, 2), 0, "schwab:futureSettlementPrice"))
+        self.assertTrue(any("confirms" in n for n in s.notes))
+
+    def test_run1_index_mirroring_the_stale_close_is_not_a_confirmation(self):
+        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.OCT, index_quotes={"$DJCING": 3.62})
+        self.assertEqual((s.price, s.session, s.stale_sessions), (2.904, date(2026, 9, 1), 1))
+        self.assertTrue(any("has not rolled either" in n for n in s.notes))
+
+    def test_run1_evening_agreement_with_a_rolled_close_confirms(self):
+        p = self.payload(closePrice=2.956)
+        p["reference"]["futureSettlementPrice"] = 2.956
+        s = nf.resolve_settle(p, nf.DEMO_NOW, contract=self.OCT, index_quotes=nf.DEMO_INDEX, prev_close_seen=2.904)
+        self.assertEqual((s.price, s.stale_sessions, s.source), (2.956, 0, "schwab:futureSettlementPrice"))
 
     def test_settle_time_from_previous_session_without_index(self):
         p = self.payload(settleTime=ms(et(2026, 9, 1, 15, 5)))
-        s = nf.resolve_settle(p, nf.DEMO_NOW, contract=self.CONTRACT)
+        s = nf.resolve_settle(p, nf.DEMO_NOW, contract=self.OCT)
         self.assertEqual((s.price, s.session, s.stale_sessions), (2.904, date(2026, 9, 1), 1))
         self.assertEqual(s.basis, "2-session")
 
-    def test_stale_despite_same_day_stamp_when_close_unchanged(self):
-        p = self.payload(settleTime=ms(et(2026, 9, 2, 17, 38)))  # the stamp the tracker printed
-        s = nf.resolve_settle(p, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes=nf.DEMO_INDEX, prev_close_seen=2.904)
-        self.assertEqual((s.price, s.stale_sessions), (2.956, 0))
-        self.assertTrue(any("claims same-day" in n for n in s.notes))
-
     def test_known_override_wins(self):
-        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.CONTRACT, known={date(2026, 9, 2): 2.956})
+        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.OCT, known={date(2026, 9, 2): 2.956})
         self.assertEqual((s.price, s.source, s.stale_sessions), (2.956, "known", 0))
 
     def test_no_evidence_same_evening_assumes_one_session_behind(self):
-        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.CONTRACT)
+        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.OCT)
         self.assertEqual((s.price, s.session, s.stale_sessions), (2.904, date(2026, 9, 1), 1))
         self.assertTrue(any("ASSUMED" in n for n in s.notes))
 
     def test_no_evidence_next_morning_takes_field_as_current(self):
-        s = nf.resolve_settle(nf.DEMO_NGV26, et(2026, 9, 3, 10, 0), contract=self.CONTRACT)
+        s = nf.resolve_settle(nf.DEMO_NGV26, et(2026, 9, 3, 10, 0), contract=self.OCT)
         self.assertEqual((s.price, s.session, s.stale_sessions), (2.904, date(2026, 9, 2), 0))
 
+    # --- run 2: the next morning ------------------------------------------------
+    def test_run2_index_confirms_rolled_close(self):
+        s = nf.resolve_settle(nf.DEMO2_NGV26, nf.DEMO2_NOW, contract=self.OCT, index_quotes=nf.DEMO2_INDEX, prev_close_seen=2.904)
+        self.assertEqual((s.price, s.session, s.stale_sessions, s.source), (2.913, date(2026, 9, 3), 0, "schwab:futureSettlementPrice"))
+        self.assertTrue(any("confirms" in n for n in s.notes))
+        self.assertTrue(any("posted-at" in n and "2026-09-03 session, 0 behind" in n for n in s.notes))
+        s = nf.resolve_settle(nf.DEMO2_NGV26, nf.DEMO2_NOW, contract=self.OCT, index_quotes=nf.DEMO2_INDEX)
+        self.assertEqual((s.price, s.stale_sessions), (2.913, 0))
+
+    def test_morning_agreement_without_history_confirms(self):
+        p = {"lastPrice": 2.97, "closePrice": 2.956}
+        s = nf.resolve_settle(p, et(2026, 9, 3, 10, 0), contract=self.OCT, index_quotes={"$DJCING": 0.47})
+        self.assertEqual((s.price, s.session, s.stale_sessions, s.source), (2.956, date(2026, 9, 2), 0, "schwab:closePrice"))
+
+    def test_rolled_close_beats_a_disagreeing_index(self):
+        p = {"lastPrice": 2.97, "closePrice": 2.956}
+        s = nf.resolve_settle(p, et(2026, 9, 3, 10, 0), contract=self.OCT, index_quotes={"$DJCING": 5.0}, prev_close_seen=2.904)
+        self.assertEqual((s.price, s.stale_sessions, s.source), (2.956, 0, "schwab:closePrice"))
+        self.assertTrue(any("keeping Schwab" in n for n in s.notes))
+
+    # --- the index derivation itself -------------------------------------------
+    def test_index_ratio_prefers_prices_over_rounded_percent(self):
+        price, why = nf.derive_settle_from_index(2.923, {"lastPrice": 158.95, "closePrice": 158.41}, date(2026, 9, 3), self.OCT, "$DJCING")
+        self.assertEqual(price, 2.913)
+        self.assertIn("158.95/158.41 (+0.34%)", why)
+        self.assertEqual(nf.derive_settle_from_index(2.923, 0.34, date(2026, 9, 3), self.OCT, "$DJCING")[0], 2.913)
+
+    def test_index_modes(self):
+        idx = {"$SPGSNG": {"netPercentChange": 2.5}}
+        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.OCT, index_quotes=idx)
+        self.assertEqual(s.price, 2.936)   # live: 3.009 / 1.025
+        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.OCT, index_quotes=idx, index_mode="close")
+        self.assertEqual(s.price, 2.977)   # close: 2.904 * 1.025
+
     def test_index_mid_roll_cannot_derive(self):
-        s = nf.resolve_settle(nf.DEMO_NGV26, et(2026, 9, 9, 18, 55), contract=self.CONTRACT, index_quotes=nf.DEMO_INDEX)
+        s = nf.resolve_settle(nf.DEMO_NGV26, et(2026, 9, 9, 18, 55), contract=self.OCT, index_quotes=nf.DEMO_INDEX)
         self.assertEqual(s.stale_sessions, 1)
         self.assertTrue(any("rolling" in n for n in s.notes))
 
@@ -198,47 +261,40 @@ class SettleTests(unittest.TestCase):
         now = et(2026, 9, 16, 18, 55)
         nov = {"quote": {"lastPrice": 3.150, "closePrice": 3.034}, "reference": {}}
         s = nf.resolve_settle(nov, now, contract=(2026, 11), index_quotes={"$SPGSNG": 1.79})
-        self.assertEqual((s.price, s.stale_sessions, s.source), (3.088, 0, "derived:$SPGSNG"))
-        s2 = nf.resolve_settle(nf.DEMO_NGV26, now, contract=self.CONTRACT, index_quotes={"$SPGSNG": 1.79})
+        self.assertEqual((s.price, s.stale_sessions, s.source), (3.095, 0, "derived:$SPGSNG"))  # 3.150 / 1.0179
+        s2 = nf.resolve_settle(nf.DEMO_NGV26, now, contract=self.OCT, index_quotes={"$SPGSNG": 1.79})
         self.assertEqual(s2.stale_sessions, 1)
         self.assertTrue(any("holds 2026-11" in n for n in s2.notes))
 
-    def test_index_live_mode_by_timestamp(self):
-        idx = {"$SPGSNG": {"netPercentChange": 2.5, "tradeTime": ms(et(2026, 9, 2, 18, 50))}}
-        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes=idx)
-        self.assertEqual(s.price, 2.936)   # 3.009 / 1.025
-        idx_close = {"$SPGSNG": {"netPercentChange": 2.5, "tradeTime": ms(et(2026, 9, 2, 14, 31))}}
-        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes=idx_close)
-        self.assertEqual(s.price, 2.977)   # 2.904 * 1.025
-
-    def test_index_that_merely_mirrors_the_stale_move_is_refused(self):
-        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes={"$DJCING": 3.62})
-        self.assertEqual((s.price, s.stale_sessions), (2.904, 1))
-        self.assertTrue(any("as stale as closePrice" in n for n in s.notes))
-
-    def test_disagreeing_indexes_are_refused(self):
-        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes={"$DJCING": 1.79, "$SPGSNG": 2.5})
+    def test_disagreeing_indexes_are_not_used(self):
+        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.OCT, index_quotes={"$DJCING": 1.79, "$SPGSNG": 2.5})
         self.assertEqual((s.price, s.stale_sessions), (2.904, 1))
         self.assertTrue(any("disagree" in n for n in s.notes))
 
     def test_index_stamped_before_settlement_is_refused(self):
-        idx = {"$SPGSNG": {"netPercentChange": 1.79, "tradeTime": ms(et(2026, 9, 1, 15, 0))}}
-        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes=idx)
+        idx = {"$SPGSNG": {"netPercentChange": 1.79, "tradeTime": ms(et(2026, 9, 2, 14, 0))}}
+        s = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=self.OCT, index_quotes=idx)
         self.assertEqual(s.stale_sessions, 1)
         self.assertTrue(any("predates" in n for n in s.notes))
 
     def test_bare_quote_dict_and_missing_fields(self):
-        s = nf.resolve_settle({"lastPrice": 3.009, "closePrice": 2.904}, nf.DEMO_NOW, contract=self.CONTRACT, index_quotes={"$DJCING": 1.79})
+        s = nf.resolve_settle({"lastPrice": 3.009, "closePrice": 2.904}, nf.DEMO_NOW, contract=self.OCT, index_quotes={"$DJCING": 1.79})
         self.assertEqual(s.price, 2.956)
-        s = nf.resolve_settle({"lastPrice": 3.009}, nf.DEMO_NOW, contract=self.CONTRACT)
+        s = nf.resolve_settle({"lastPrice": 3.009}, nf.DEMO_NOW, contract=self.OCT)
         self.assertEqual((s.price, s.source), (None, "none"))
         self.assertEqual(s.label(), "settle unavailable")
+
+    def test_round_tick(self):
+        self.assertEqual(nf._round_tick(2.9125), 2.913)
+        self.assertEqual(nf._round_tick(2.9124), 2.912)
+        self.assertEqual(nf._round_tick(3.00912), 3.009)
 
     def test_field_report(self):
         line = nf.settle_field_report(nf.DEMO_NGV26, nf.DEMO_NOW)
         self.assertIn("base 2.904", line)
         self.assertIn("futurePercentChange +3.62%", line)
         self.assertTrue(line.startswith("09-02 18:55 ET"))
+        self.assertIn("settleTime 09-04 07:53 ET", nf.settle_field_report(nf.DEMO2_NGV26, nf.DEMO2_NOW))
 
 
 class CaptureTests(unittest.TestCase):
@@ -250,6 +306,11 @@ class CaptureTests(unittest.TestCase):
         self.assertAlmostEqual(boil.raw, 2.201, places=3)
         self.assertAlmostEqual(boil.of_target, 1.101, places=3)
         self.assertIn("2.20x of NG (target 2.0x) = 1.10 of target", boil.render())
+
+    def test_same_window_1600_prints(self):
+        c = nf.capture(-5.16, -2.44, 2.0, ng_window="16:00->16:00")
+        self.assertAlmostEqual(c.raw, 2.115, places=3)
+        self.assertIn("2.11x of NG (target 2.0x) = 1.06 of target · NG 16:00->16:00 -2.44%", c.render())
 
     def test_flat_day_has_no_capture(self):
         c = nf.capture(0.5, 0.1)
@@ -288,7 +349,7 @@ class FormattingTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
-    def test_headline(self):
+    def test_headline_run1(self):
         settle = nf.resolve_settle(nf.DEMO_NGV26, nf.DEMO_NOW, contract=(2026, 10), index_quotes=nf.DEMO_INDEX)
         lines = nf.render_headline("/NGV26", 3.009, settle, 326958, nf.DEMO_NOW)
         self.assertIn("+0.053 (+1.79%, day)", lines[0])
@@ -297,11 +358,18 @@ class RenderTests(unittest.TestCase):
         self.assertIn("+0.105 (+3.62%, 2-session)", lines[1])
         self.assertIn("expires 2026-09-28 · 17 trading days left", lines[2])
 
+    def test_headline_run2(self):
+        settle = nf.resolve_settle(nf.DEMO2_NGV26, nf.DEMO2_NOW, contract=(2026, 10), index_quotes=nf.DEMO2_INDEX)
+        lines = nf.render_headline("/NGV26", 2.923, settle, 310695, nf.DEMO2_NOW)
+        self.assertIn("+0.010 (+0.34%, day)  vs 09-03 settle 2.913 [schwab:futureSettlementPrice, day basis]", lines[0])
+        self.assertIn("15 trading days left (16 weekdays, 09-07 excluded)", lines[1])
+
     def test_demo_runs(self):
         out = nf.demo()
-        self.assertIn("2.956", out)
+        self.assertIn("RUN 2", out)
         self.assertIn("capture 1.21x of NG (target 1.0x) = 1.21 of target", out)
         self.assertIn("capture 2.20x of NG (target 2.0x) = 1.10 of target", out)
+        self.assertIn("confirms Schwab futureSettlementPrice 2.913", out)
 
 
 if __name__ == "__main__":
