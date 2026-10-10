@@ -46,6 +46,15 @@ Always run tests after modifying hooks or skills. Five levels:
 
 **CI:** `node scripts/test-all.js` exits non-zero on any failure. Use `--strict` to treat WARNs as failures.
 
+## Cursor Cloud specific instructions
+
+Citadel has no npm dependencies and no build. Node.js 18+ is the only toolchain, and `node` is already on PATH. Do not run `npm install`.
+
+- Full check: `node scripts/test-all.js` (no network, no LLM).
+- Harness heartbeat: `node scripts/health.js`.
+- Interactive router: `docs/index.html`. Cloud Agent boot serves it at http://127.0.0.1:8080.
+- `scripts/local-daemon.js` needs the `claude` CLI plus `.planning/daemon.json`. Do not start it for environment checks.
+
 ## Handoff Summary (Required)
 
 After completing any task, output a `HANDOFF` block:
